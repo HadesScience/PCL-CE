@@ -41,12 +41,10 @@ public partial class PageInstanceCompJarInJar
     private bool _AnyEmbeddedMatch(List<CompFile> embedded) =>
         embedded is not null && embedded.Any(e => _Match(e) || _AnyEmbeddedMatch(e.EmbeddedMods));
 
-    private IEnumerable<CompFile> _DistinctEmbedded(CompFile host)
+    private IEnumerable<CompFile> _LoadableEmbedded(CompFile host)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var n in _index.GetLoadableEmbedded(host))
-            if (string.IsNullOrEmpty(n.ModId) || seen.Add(n.ModId))
-                yield return n;
+            yield return n;
     }
 
     private static void GoBack()
@@ -82,7 +80,7 @@ public partial class PageInstanceCompJarInJar
         {
             if (host.State != CompFile.LocalFileStatus.Fine) continue; // 禁用的 mod 不加载，其缺失前置不算问题
             if (_Match(host)) _AppendMissingWarning(host, null, host.DetectedLoader);
-            foreach (var node in _DistinctEmbedded(host))
+            foreach (var node in _LoadableEmbedded(host))
                 if (_Match(node))
                     _AppendMissingWarning(node, host, node.JijLoader);
         }
@@ -113,7 +111,7 @@ public partial class PageInstanceCompJarInJar
                 relationCount++;
             }
 
-            foreach (var node in _DistinctEmbedded(host))
+            foreach (var node in _LoadableEmbedded(host))
             {
                 var nodeDeps = ModJarInJarIndex.BuildOwnDependencies(node, node.JijLoader)
                     .Where(d => !ModJarInJarIndex.IsPlatform(d.DepId)).ToList();

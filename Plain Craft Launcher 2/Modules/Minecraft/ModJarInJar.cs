@@ -14,12 +14,29 @@ public static class ModJarInJar
 {
     private const int MaxDepth = 5;
     private const int MaxNodes = 512;
+    private const long MaxEntryBytes = 256L * 1024 * 1024;
+    private const long MaxTotalBytes = 512L * 1024 * 1024;
+
+    private sealed class _ResolveBudget
+    {
+        public int NodesRemaining = MaxNodes;
+        public long BytesRemaining = MaxTotalBytes;
+        public bool Incomplete;
+    }
+
+    private sealed class _NestedJarInfo
+    {
+        public string Path;
+        public string Identifier;
+        public string VersionRange;
+        public string ArtifactVersion;
+    }
 
     /// <summary>
     ///     解析 <paramref name="jar" /> 内嵌套的其它 Mod jar，返回内嵌 Mod 列表。
     /// </summary>
     public static List<ModLocalComp.LocalCompFile> Resolve(string parentPath, ZipArchive jar, int depth = 0)
-        => _Resolve(parentPath, jar, depth, new[] { MaxNodes, 0 });
+        => _Resolve(parentPath, jar, depth, new _ResolveBudget());
 
     /// <summary>
     ///     带持久化缓存的解析：按文件指纹命中缓存则直接重建，否则解析并写入缓存（批量结束后需调用
@@ -46,11 +63,11 @@ public static class ModJarInJar
         // 不在首屏同步解压嵌套 jar（冷缓存下几百个 mod 的递归解压会拖慢列表出现）
         if (deferOnMiss) return null;
 
-        var budget = new[] { MaxNodes, 0 };
+        var budget = new _ResolveBudget();
         var tree = _Resolve(modFilePath, jar, 0, budget);
-        // 截断树（预算耗尽，budget[1]==1）不入盘：宿主指纹不变会被永久复用，缺失的 id 永不再现；下次启动重扫
+        // 截断/失败树不入盘：宿主指纹不变会被永久复用，缺失的 id 永不再现；下次启动重扫
         // self?.BuildJijSelfNode() 直接读字段，不经属性 getter——否则会在 Load() 内重入 Load() 无限递归卡死
-        if (budget[1] == 0)
+        if (!budget.Incomplete)
             ModJarInJarCache.Set(modFilePath, lastModified, size, _ToNodes(tree), self?.BuildJijSelfNode());
         return tree;
     }
@@ -64,11 +81,15 @@ public static class ModJarInJar
             Version = m.Version,
             Loader = m.JijLoader,
             TargetMcVersion = m.JijTargetMcVersion,
-            Dependencies = new Dictionary<string, string>(m.DependencyRaw),
-            OptionalDeps = m.OptionalDependencies.ToList(),
-            Conflicts = m.Conflicts.Select(kv => new EmbeddedConflict
-                { Target = kv.Key, Raw = kv.Value.Raw, Hard = kv.Value.Hard }).ToList(),
+            DependencyRows = m.DependencyDeclarations.Select(d => new EmbeddedDependency
+                { Id = d.Id, Raw = d.Raw, Optional = d.Optional }).ToList(),
+            Conflicts = m.ConflictDeclarations.Select(c => new EmbeddedConflict
+                { Target = c.Target, Raw = c.Raw, Hard = c.Hard }).ToList(),
             ProvidedIds = m.ProvidedIds.ToList(),
+            ProvidedVersions = new Dictionary<string, string>(m.ProvidedVersions),
+            JijIdentifier = m.JijIdentifier,
+            JijVersionRange = m.JijVersionRange,
+            JijArtifactVersion = m.JijArtifactVersion,
             Children = _ToNodes(m.EmbeddedMods)
         }).ToList();
 
@@ -83,8 +104,11 @@ public static class ModJarInJar
             child.SetJijMetadata(node.Name, node.ModId, node.Version);
             child.JijLoader = node.Loader;
             child.JijTargetMcVersion = node.TargetMcVersion;
-            child.SetJijDependencies(node.Dependencies, node.OptionalDeps);
-            child.SetJijConflicts(node.Conflicts, node.ProvidedIds);
+            child.JijIdentifier = node.JijIdentifier;
+            child.JijVersionRange = node.JijVersionRange;
+            child.JijArtifactVersion = node.JijArtifactVersion;
+            child.SetJijDependencies(node.DependencyRows);
+            child.SetJijConflicts(node.Conflicts, node.ProvidedIds, node.ProvidedVersions);
             child.EmbeddedMods = _FromNodes(node.Children, childPath);
             result.Add(child);
         }
@@ -92,32 +116,50 @@ public static class ModJarInJar
         return result;
     }
 
-    private static List<ModLocalComp.LocalCompFile> _Resolve(string parentPath, ZipArchive jar, int depth, int[] budget)
+    private static List<ModLocalComp.LocalCompFile> _Resolve(string parentPath, ZipArchive jar, int depth,
+        _ResolveBudget budget)
     {
         var result = new List<ModLocalComp.LocalCompFile>();
-        if (depth >= MaxDepth) return result;
-
-        var nestedPaths = new List<string>();
-        _CollectFabricNestedJars(jar, nestedPaths);
-        _CollectQuiltNestedJars(jar, nestedPaths);
-        _CollectForgeNestedJars(jar, nestedPaths);
-        _CollectManifestEmbeddedJars(jar, nestedPaths);
-
-        foreach (var nestedPath in nestedPaths.Distinct())
+        var nested = new List<_NestedJarInfo>();
+        _CollectFabricNestedJars(jar, nested);
+        _CollectQuiltNestedJars(jar, nested);
+        _CollectForgeNestedJars(jar, nested);
+        _CollectManifestEmbeddedJars(jar, nested);
+        nested = nested.Where(n => !string.IsNullOrWhiteSpace(n.Path))
+            .GroupBy(n => n.Path, StringComparer.Ordinal)
+            .Select(g => g.OrderByDescending(n => n.Identifier is not null).First())
+            .ToList();
+        if (depth >= MaxDepth)
         {
-            if (budget[0] <= 0)
+            if (nested.Count > 0) budget.Incomplete = true;
+            return result;
+        }
+
+        foreach (var info in nested)
+        {
+            if (budget.NodesRemaining <= 0)
             {
-                budget[1] = 1; // 节点预算耗尽，标记截断（供上层决定不入盘），避免病态嵌套爆树
+                budget.Incomplete = true; // 节点预算耗尽，避免病态嵌套爆树
                 break;
             }
 
-            var entry = jar.GetEntry(nestedPath);
+            var entry = jar.GetEntry(info.Path);
             if (entry is null) continue;
-            budget[0]--;
+            if (entry.Length > MaxEntryBytes || entry.Length > budget.BytesRemaining)
+            {
+                budget.Incomplete = true;
+                ModBase.Log("跳过过大的内嵌 Mod（" + parentPath + " -> " + info.Path + "，" + entry.Length +
+                            " bytes）", ModBase.LogLevel.Developer);
+                continue;
+            }
+            budget.NodesRemaining--;
 
-            var childPath = parentPath + "!/" + nestedPath;
+            var childPath = parentPath + "!/" + info.Path;
             var child = new ModLocalComp.LocalCompFile(childPath);
             child.MarkLoaded();
+            child.JijIdentifier = info.Identifier;
+            child.JijVersionRange = info.VersionRange;
+            child.JijArtifactVersion = info.ArtifactVersion;
             // 始终列出该内嵌项：即使下方元数据解析/递归失败，也能按文件名保留（不丢节点）
             result.Add(child);
 
@@ -128,7 +170,7 @@ public static class ModJarInJar
                 tmp = Path.GetTempFileName();
                 using (var es = entry.Open())
                 using (var fs = File.Create(tmp))
-                    es.CopyTo(fs);
+                    _CopyWithBudget(es, fs, budget);
                 using var nestedJar = ZipFile.OpenRead(tmp);
                 child.LookupMetadata(nestedJar);
                 child.JijLoader = DetectLoader(nestedJar);
@@ -138,7 +180,8 @@ public static class ModJarInJar
             }
             catch (Exception ex)
             {
-                ModBase.Log(ex, "解析内嵌 Mod 失败（" + parentPath + " -> " + nestedPath + "）", ModBase.LogLevel.Developer);
+                budget.Incomplete = true;
+                ModBase.Log(ex, "解析内嵌 Mod 失败（" + parentPath + " -> " + info.Path + "）", ModBase.LogLevel.Developer);
             }
             finally
             {
@@ -151,7 +194,26 @@ public static class ModJarInJar
         return result;
     }
 
-    private static void _CollectFabricNestedJars(ZipArchive jar, List<string> paths)
+    private static void _CopyWithBudget(Stream input, Stream output, _ResolveBudget budget)
+    {
+        var buffer = new byte[81920];
+        long entryBytes = 0;
+        while (true)
+        {
+            var read = input.Read(buffer, 0, buffer.Length);
+            if (read <= 0) return;
+            entryBytes += read;
+            budget.BytesRemaining -= read;
+            if (entryBytes > MaxEntryBytes || budget.BytesRemaining < 0)
+            {
+                budget.Incomplete = true;
+                throw new InvalidDataException("内嵌 Mod 解压体积超过安全上限");
+            }
+            output.Write(buffer, 0, read);
+        }
+    }
+
+    private static void _CollectFabricNestedJars(ZipArchive jar, List<_NestedJarInfo> found)
     {
         try
         {
@@ -161,7 +223,7 @@ public static class ModJarInJar
             if (obj.TryGetPropertyValue("jars", out var jars) && jars is JsonArray arr)
                 foreach (var j in arr)
                     if (j is JsonObject jo && jo.TryGetPropertyValue("file", out var file) && file is not null)
-                        paths.Add(file.ToString());
+                        found.Add(new _NestedJarInfo { Path = file.ToString() });
         }
         catch (Exception ex)
         {
@@ -169,7 +231,7 @@ public static class ModJarInJar
         }
     }
 
-    private static void _CollectForgeNestedJars(ZipArchive jar, List<string> paths)
+    private static void _CollectForgeNestedJars(ZipArchive jar, List<_NestedJarInfo> found)
     {
         try
         {
@@ -179,7 +241,21 @@ public static class ModJarInJar
             if (obj.TryGetPropertyValue("jars", out var jars) && jars is JsonArray arr)
                 foreach (var j in arr)
                     if (j is JsonObject jo && jo.TryGetPropertyValue("path", out var p) && p is not null)
-                        paths.Add(p.ToString());
+                    {
+                        var identifier = jo["identifier"] as JsonObject;
+                        var version = jo["version"] as JsonObject;
+                        var group = identifier?["group"]?.ToString();
+                        var artifact = identifier?["artifact"]?.ToString();
+                        found.Add(new _NestedJarInfo
+                        {
+                            Path = p.ToString(),
+                            Identifier = string.IsNullOrWhiteSpace(group) || string.IsNullOrWhiteSpace(artifact)
+                                ? null
+                                : group + ":" + artifact,
+                            VersionRange = version?["range"]?.ToString(),
+                            ArtifactVersion = version?["artifactVersion"]?.ToString()
+                        });
+                    }
         }
         catch (Exception ex)
         {
@@ -188,7 +264,7 @@ public static class ModJarInJar
     }
 
     // Quilt：quilt.mod.json 的 quilt_loader.jars（字符串数组，直接为内嵌 jar 路径）
-    private static void _CollectQuiltNestedJars(ZipArchive jar, List<string> paths)
+    private static void _CollectQuiltNestedJars(ZipArchive jar, List<_NestedJarInfo> found)
     {
         try
         {
@@ -200,7 +276,7 @@ public static class ModJarInJar
                 foreach (var j in arr)
                 {
                     var s = j?.ToString();
-                    if (!string.IsNullOrEmpty(s)) paths.Add(s);
+                    if (!string.IsNullOrEmpty(s)) found.Add(new _NestedJarInfo { Path = s });
                 }
         }
         catch (Exception ex)
@@ -210,7 +286,7 @@ public static class ModJarInJar
     }
 
     // JAR manifest 的 Embedded-Dependencies-Mod：无 mods.toml 的“包装 jar”仅通过它声明内嵌 mod
-    private static void _CollectManifestEmbeddedJars(ZipArchive jar, List<string> paths)
+    private static void _CollectManifestEmbeddedJars(ZipArchive jar, List<_NestedJarInfo> found)
     {
         try
         {
@@ -230,7 +306,7 @@ public static class ModJarInJar
             {
                 if (!line.StartsWith("Embedded-Dependencies-Mod:", StringComparison.OrdinalIgnoreCase)) continue;
                 var value = line.Substring("Embedded-Dependencies-Mod:".Length).Trim();
-                if (!string.IsNullOrEmpty(value)) paths.Add(value);
+                if (!string.IsNullOrEmpty(value)) found.Add(new _NestedJarInfo { Path = value });
                 return;
             }
         }

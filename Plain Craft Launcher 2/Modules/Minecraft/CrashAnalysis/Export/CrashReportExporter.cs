@@ -282,28 +282,25 @@ internal sealed class CrashReportExporter
                     scanFolders.Add(versionSubFolder);
             }
 
-            var activeMods = new List<ModLocalComp.LocalCompFile>();
+            var allMods = new List<ModLocalComp.LocalCompFile>();
             foreach (var folder in scanFolders)
                 foreach (var file in Directory.GetFiles(folder))
                 {
-                    if (!ModLocalComp.LocalCompFile.IsModFile(file)
-                        || file.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)
-                        || file.EndsWith(".old", StringComparison.OrdinalIgnoreCase))
-                        continue;
+                    if (!ModLocalComp.LocalCompFile.IsModFile(file)) continue;
                     var mod = new ModLocalComp.LocalCompFile(file);
                     mod.Load();
-                    if (mod.State == ModLocalComp.LocalCompFile.LocalFileStatus.Fine)
-                        activeMods.Add(mod);
+                    if (mod.State != ModLocalComp.LocalCompFile.LocalFileStatus.Unavailable) allMods.Add(mod);
                 }
 
-            activeMods = activeMods
+            var activeMods = allMods.Where(m => m.State == ModLocalComp.LocalCompFile.LocalFileStatus.Fine)
                 .OrderBy(m => m.Name ?? m.FileName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+            var jij = new ModJarInJarIndex(allMods, instance.Info.VanillaName);
 
             var sb = new StringBuilder();
 
             // 依赖警告与冲突关系放在最前，崩溃排查时第一眼可见
-            _AppendDependencyIssues(sb, activeMods, instance.Info.VanillaName);
+            _AppendDependencyIssues(sb, jij, activeMods);
 
             var modsByModId = new Dictionary<string, List<ModLocalComp.LocalCompFile>>(StringComparer.OrdinalIgnoreCase);
             foreach (var mod in activeMods)
@@ -317,7 +314,7 @@ internal sealed class CrashReportExporter
 
             var duplicates = new List<string>();
             foreach (var host in activeMods)
-                foreach (var embedded in _FlattenEmbedded(host.EmbeddedMods))
+                foreach (var embedded in jij.GetLoadableEmbedded(host))
                 {
                     if (string.IsNullOrEmpty(embedded.ModId)
                         || !modsByModId.TryGetValue(embedded.ModId, out var matches))
@@ -391,11 +388,9 @@ internal sealed class CrashReportExporter
     }
 
     // 把模组关系页的「缺失前置/版本不符」警告与「不兼容/不建议共存」冲突一并写入崩溃模组信息
-    private static void _AppendDependencyIssues(StringBuilder sb, List<ModLocalComp.LocalCompFile> activeMods,
-        string mc)
+    private static void _AppendDependencyIssues(StringBuilder sb, ModJarInJarIndex jij,
+        List<ModLocalComp.LocalCompFile> activeMods)
     {
-        var jij = new ModJarInJarIndex(activeMods, mc);
-
         sb.AppendLine(Lang.Text("Crash.Report.JarInJarMod.WarningSection"));
         var warned = false;
         foreach (var mod in activeMods)
@@ -455,17 +450,6 @@ internal sealed class CrashReportExporter
                     (a.Name ?? a.FileName) + " / " + (b.Name ?? b.FileName));
 
         sb.AppendLine().AppendLine("----------------------------").AppendLine();
-    }
-
-    private static IEnumerable<ModLocalComp.LocalCompFile> _FlattenEmbedded(List<ModLocalComp.LocalCompFile> mods)
-    {
-        foreach (var mod in mods)
-        {
-            yield return mod;
-            if (mod.EmbeddedMods.Any())
-                foreach (var child in _FlattenEmbedded(mod.EmbeddedMods))
-                    yield return child;
-        }
     }
 
     private static void _AppendEmbeddedMods(StringBuilder builder, List<ModLocalComp.LocalCompFile> mods, int depth)

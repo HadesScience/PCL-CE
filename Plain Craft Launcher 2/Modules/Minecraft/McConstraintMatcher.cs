@@ -85,12 +85,136 @@ public static class McConstraintMatcher
     // 比较两个版本，各自先剥前导 v
     private static int Cmp(string a, string b) => McVersionComparer.CompareVersion(StripV(a), StripV(b));
 
-    /// <summary>约束是否有可解析的下界版本（供 provider 检查：无可解析下界时应 fail-open 而非误判缺失）。</summary>
-    public static bool HasComparableLowerBound(string constraint)
+    /// <summary>
+    ///     比较常见 Maven/Forge 版本。数字段按数值比较；限定符顺序为
+    ///     alpha &lt; beta &lt; milestone &lt; rc &lt; snapshot &lt; release &lt; sp。
+    /// </summary>
+    public static int CompareMavenVersions(string left, string right)
+    {
+        var a = _TokenizeMaven(StripV(left?.Trim() ?? ""));
+        var b = _TokenizeMaven(StripV(right?.Trim() ?? ""));
+        var count = Math.Max(a.Count, b.Count);
+        for (var i = 0; i < count; i++)
+        {
+            var x = i < a.Count ? a[i] : null;
+            var y = i < b.Count ? b[i] : null;
+            var c = _CompareMavenToken(x, y);
+            if (c != 0) return c;
+        }
+
+        return 0;
+    }
+
+    private static List<string> _TokenizeMaven(string version)
+    {
+        var result = new List<string>();
+        var current = "";
+        bool? digits = null;
+        foreach (var ch in version.ToLowerInvariant())
+        {
+            if (ch is '.' or '-' or '_' or '+')
+            {
+                if (current.Length > 0) result.Add(current);
+                current = "";
+                digits = null;
+                continue;
+            }
+
+            var isDigit = char.IsDigit(ch);
+            if (digits is not null && digits != isDigit)
+            {
+                if (current.Length > 0) result.Add(current);
+                current = "";
+            }
+
+            current += ch;
+            digits = isDigit;
+        }
+
+        if (current.Length > 0) result.Add(current);
+        return result;
+    }
+
+    private static int _CompareMavenToken(string left, string right)
+    {
+        var leftNumeric = left is not null && IsAllDigits(left);
+        var rightNumeric = right is not null && IsAllDigits(right);
+        if (leftNumeric && rightNumeric) return CompareNumericId(left, right);
+        if (leftNumeric) return CompareNumericId(left, "0") == 0
+            ? _CompareMavenQualifier("", right)
+            : 1;
+        if (rightNumeric) return CompareNumericId("0", right) == 0
+            ? _CompareMavenQualifier(left, "")
+            : -1;
+        return _CompareMavenQualifier(left ?? "", right ?? "");
+    }
+
+    private static int _CompareMavenQualifier(string left, string right)
+    {
+        static (int Rank, string Name) Normalize(string value)
+        {
+            value = value?.ToLowerInvariant() ?? "";
+            value = value switch
+            {
+                "a" => "alpha",
+                "b" => "beta",
+                "m" => "milestone",
+                "cr" => "rc",
+                "ga" or "final" or "release" => "",
+                _ => value
+            };
+            return value switch
+            {
+                "alpha" => (-5, ""),
+                "beta" => (-4, ""),
+                "milestone" => (-3, ""),
+                "rc" => (-2, ""),
+                "snapshot" => (-1, ""),
+                "" => (0, ""),
+                "sp" => (1, ""),
+                _ => (2, value)
+            };
+        }
+
+        var a = Normalize(left);
+        var b = Normalize(right);
+        var rank = a.Rank.CompareTo(b.Rank);
+        return rank != 0 ? rank : string.CompareOrdinal(a.Name, b.Name);
+    }
+
+    /// <summary>
+    ///     约束是否至少有一个可解析的版本边界，供 provider 检查时判断能否可靠地报告版本不符。
+    ///     Maven 区间的上界同样是有效边界，例如 <c>(,2.0)</c> 必须拒绝 3.0，不能因缺少下界而 fail-open。
+    /// </summary>
+    public static bool HasComparableBound(string constraint)
     {
         if (string.IsNullOrWhiteSpace(constraint)) return false;
-        var t = constraint.TrimStart('[', '(', '>', '<', '=', '~', '^', ' ', '"');
-        return IsKnown(t);
+        foreach (var interval in SplitTopLevel(constraint))
+        {
+            var s = interval.Trim();
+            if (s.Length == 0) continue;
+            if (s[0] != '[' && s[0] != '(')
+            {
+                var bare = s.TrimStart('>', '<', '=', '~', '^', ' ', '"');
+                if (IsKnown(bare)) return true;
+                continue;
+            }
+
+            if (s.Length < 2 || (s[^1] != ']' && s[^1] != ')')) continue;
+            var body = s.Substring(1, s.Length - 2);
+            var comma = body.IndexOf(',');
+            if (comma < 0)
+            {
+                if (IsKnown(body.Trim())) return true; // [a] 精确
+                continue;
+            }
+
+            var lo = body.Substring(0, comma).Trim();
+            var hi = body.Substring(comma + 1).Trim();
+            if (IsKnown(lo) || IsKnown(hi)) return true;
+        }
+
+        return false;
     }
 
     // 版本串是否可比较（1.20.1 / 26.1 / 23w13a 数字开头，或 v0.5.1c 剥 v 后数字开头；剥掉 Fabric 尾 - 后判断）
@@ -113,7 +237,7 @@ public static class McConstraintMatcher
 
             if (s[0] != '[' && s[0] != '(')
             {
-                if (IsKnown(s) && Cmp(mc,s) >= 0) return true; // 裸版本=软下限
+                if (IsKnown(s) && CompareMavenVersions(mc, s) >= 0) return true; // 裸版本=软下限
                 continue;
             }
 
@@ -125,7 +249,7 @@ public static class McConstraintMatcher
             if (comma < 0)
             {
                 var only = body.Trim(); // [a] 精确
-                if (IsKnown(only) && Cmp(mc,only) == 0) return true;
+                if (IsKnown(only) && CompareMavenVersions(mc, only) == 0) return true;
                 continue;
             }
 
@@ -136,13 +260,13 @@ public static class McConstraintMatcher
             var ok = true;
             if (loStr.Length > 0)
             {
-                var c = Cmp(mc,loStr);
+                var c = CompareMavenVersions(mc, loStr);
                 ok = incLo ? c >= 0 : c > 0;
             }
 
             if (ok && hiStr.Length > 0)
             {
-                var c = Cmp(mc,hiStr);
+                var c = CompareMavenVersions(mc, hiStr);
                 ok = incHi ? c <= 0 : c < 0;
             }
 
@@ -185,12 +309,30 @@ public static class McConstraintMatcher
         var bPre = b.IndexOf('-');
         var aBase = aPre < 0 ? a : a.Substring(0, aPre);
         var bBase = bPre < 0 ? b : b.Substring(0, bPre);
-        var c = Cmp(aBase, bBase);
+        var c = _CompareSemVerCore(aBase, bBase);
         if (c != 0) return c;
         if (aPre < 0 && bPre < 0) return 0;
         if (aPre < 0) return 1; // a 无预发布 > b（有预发布）
         if (bPre < 0) return -1; // a 有预发布 < b（正式版）
         return ComparePrerelease(a.Substring(aPre + 1), b.Substring(bPre + 1));
+    }
+
+    private static int _CompareSemVerCore(string left, string right)
+    {
+        var a = left.Split('.');
+        var b = right.Split('.');
+        if (a.All(IsAllDigits) && b.All(IsAllDigits))
+        {
+            var count = Math.Max(a.Length, b.Length);
+            for (var i = 0; i < count; i++)
+            {
+                var c = CompareNumericId(i < a.Length ? a[i] : "0", i < b.Length ? b[i] : "0");
+                if (c != 0) return c;
+            }
+            return 0;
+        }
+
+        return Cmp(left, right);
     }
 
     private static int ComparePrerelease(string a, string b)

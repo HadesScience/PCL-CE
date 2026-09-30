@@ -863,6 +863,20 @@ public static class ModLocalComp
 
         private readonly Dictionary<string, string> _DependencyRaw = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        ///     全部依赖声明。同一 ModId 的不同范围、声明方或可选性不会被字典合并，供 JIJ 关系分析使用。
+        /// </summary>
+        public IReadOnlyList<EmbeddedDependency> DependencyDeclarations
+        {
+            get
+            {
+                Load();
+                return _DependencyDeclarations;
+            }
+        }
+
+        private readonly List<EmbeddedDependency> _DependencyDeclarations = new();
+
         private readonly HashSet<string> _RequiredDeclared = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
@@ -880,6 +894,18 @@ public static class ModLocalComp
 
         private readonly HashSet<string> _ProvidedIds = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>multi-mod JAR 中兄弟 ModId 各自声明的版本；Fabric provides 未指定版本时回退主版本。</summary>
+        public IReadOnlyDictionary<string, string> ProvidedVersions
+        {
+            get
+            {
+                Load();
+                return _ProvidedVersions;
+            }
+        }
+
+        private readonly Dictionary<string, string> _ProvidedVersions = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         ///     本文件声明的冲突/排斥关系：key=对方 ModId，value=(冲突生效的版本约束 null=任意版本, Hard=硬冲突)。
         ///     Hard(Forge incompatible / Fabric breaks)=无法共同加载；软(discouraged / conflicts)=不建议共存。
@@ -896,6 +922,18 @@ public static class ModLocalComp
         private readonly Dictionary<string, (string Raw, bool Hard)> _Conflicts =
             new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>全部冲突声明；同一目标的不同范围与严重级别分别保留。</summary>
+        public IReadOnlyList<EmbeddedConflict> ConflictDeclarations
+        {
+            get
+            {
+                Load();
+                return _ConflictDeclarations;
+            }
+        }
+
+        private readonly List<EmbeddedConflict> _ConflictDeclarations = new();
+
         // 记录一条冲突：同 id 取更严重(Hard 优先)，版本约束取首个可解析值
         private void _AddConflict(string modID, string versionRange, bool hard)
         {
@@ -903,6 +941,10 @@ public static class ModLocalComp
             modID = modID.ToLower();
             if (ModDependencyIds.IsPlatform(modID)) return; // 不报"与加载器/minecraft 冲突"
             var raw = string.IsNullOrWhiteSpace(versionRange) || versionRange.Contains("$") ? null : versionRange;
+            if (!_ConflictDeclarations.Any(c =>
+                    string.Equals(c.Target, modID, StringComparison.OrdinalIgnoreCase) && c.Raw == raw &&
+                    c.Hard == hard))
+                _ConflictDeclarations.Add(new EmbeddedConflict { Target = modID, Raw = raw, Hard = hard });
             _Conflicts[modID] = _Conflicts.TryGetValue(modID, out var old)
                 ? (old.Raw ?? raw, old.Hard || hard)
                 : (raw, hard);
@@ -923,6 +965,13 @@ public static class ModLocalComp
             var raw = string.IsNullOrWhiteSpace(versionRequirement) || versionRequirement.Contains("$")
                 ? null
                 : versionRequirement;
+            if (!optional)
+                _DependencyDeclarations.RemoveAll(d =>
+                    string.Equals(d.Id, modID, StringComparison.OrdinalIgnoreCase) && d.Optional);
+            if ((!optional || !_RequiredDeclared.Contains(modID)) && !_DependencyDeclarations.Any(d =>
+                    string.Equals(d.Id, modID, StringComparison.OrdinalIgnoreCase) && d.Raw == raw &&
+                    d.Optional == optional))
+                _DependencyDeclarations.Add(new EmbeddedDependency { Id = modID, Raw = raw, Optional = optional });
             if (!_DependencyRaw.TryGetValue(modID, out var oldRaw) || oldRaw is null) _DependencyRaw[modID] = raw;
 
             if (versionRequirement is null ||
@@ -1024,11 +1073,15 @@ public static class ModLocalComp
             ModId = _ModId,
             Version = _Version,
             Loader = DetectedLoader,
-            Dependencies = new Dictionary<string, string>(_DependencyRaw),
-            OptionalDeps = _OptionalDependencies.ToList(),
-            Conflicts = _Conflicts.Select(kv => new EmbeddedConflict
-                { Target = kv.Key, Raw = kv.Value.Raw, Hard = kv.Value.Hard }).ToList(),
-            ProvidedIds = _ProvidedIds.ToList()
+            DependencyRows = _DependencyDeclarations.Select(d => new EmbeddedDependency
+                { Id = d.Id, Raw = d.Raw, Optional = d.Optional }).ToList(),
+            Conflicts = _ConflictDeclarations.Select(c => new EmbeddedConflict
+                { Target = c.Target, Raw = c.Raw, Hard = c.Hard }).ToList(),
+            ProvidedIds = _ProvidedIds.ToList(),
+            ProvidedVersions = new Dictionary<string, string>(_ProvidedVersions),
+            JijIdentifier = this.JijIdentifier,
+            JijVersionRange = this.JijVersionRange,
+            JijArtifactVersion = this.JijArtifactVersion
         };
 
         internal void SetJijMetadata(string name, string modId, string version)
@@ -1040,25 +1093,40 @@ public static class ModLocalComp
         }
 
         /// <summary>由 Jar-in-Jar 缓存重建内嵌项时恢复其依赖声明（供该内嵌项作为依赖方参与分析）。</summary>
-        internal void SetJijDependencies(Dictionary<string, string> rawDeps, List<string> optional)
+        internal void SetJijDependencies(List<EmbeddedDependency> declarations)
         {
+            _Dependencies = new Dictionary<string, string>();
             _DependencyRaw.Clear();
-            if (rawDeps is not null)
-                foreach (var kv in rawDeps) _DependencyRaw[kv.Key] = kv.Value;
+            _DependencyDeclarations.Clear();
             _OptionalDependencies.Clear();
-            if (optional is not null) _OptionalDependencies.UnionWith(optional);
+            _RequiredDeclared.Clear();
+            if (declarations is null) return;
+            foreach (var declaration in declarations)
+            {
+                if (declaration?.Id is null) continue;
+                AddDependency(declaration.Id, declaration.Raw, declaration.Optional);
+            }
         }
 
         /// <summary>由 Jar-in-Jar 缓存重建内嵌项时恢复其冲突声明与别名（供该内嵌项参与冲突/provider 分析）。</summary>
-        internal void SetJijConflicts(List<EmbeddedConflict> conflicts, List<string> provided)
+        internal void SetJijConflicts(List<EmbeddedConflict> conflicts, List<string> provided,
+            Dictionary<string, string> providedVersions)
         {
             _Conflicts.Clear();
+            _ConflictDeclarations.Clear();
             if (conflicts is not null)
                 foreach (var c in conflicts)
                     if (!string.IsNullOrEmpty(c?.Target))
+                    {
+                        _ConflictDeclarations.Add(new EmbeddedConflict
+                            { Target = c.Target, Raw = c.Raw, Hard = c.Hard });
                         _Conflicts[c.Target] = (c.Raw, c.Hard);
+                    }
             _ProvidedIds.Clear();
             if (provided is not null) _ProvidedIds.UnionWith(provided);
+            _ProvidedVersions.Clear();
+            if (providedVersions is not null)
+                foreach (var kv in providedVersions) _ProvidedVersions[kv.Key] = kv.Value;
         }
 
         /// <summary>
@@ -1078,17 +1146,30 @@ public static class ModLocalComp
                 _Dependencies = new Dictionary<string, string>(other._Dependencies);
                 _DependencyRaw.Clear();
                 foreach (var kv in other._DependencyRaw) _DependencyRaw[kv.Key] = kv.Value;
+                _DependencyDeclarations.Clear();
+                foreach (var d in other._DependencyDeclarations)
+                    _DependencyDeclarations.Add(new EmbeddedDependency
+                        { Id = d.Id, Raw = d.Raw, Optional = d.Optional });
                 _OptionalDependencies.Clear();
                 _OptionalDependencies.UnionWith(other._OptionalDependencies);
                 _RequiredDeclared.Clear();
                 _RequiredDeclared.UnionWith(other._RequiredDeclared);
                 _ProvidedIds.Clear();
                 _ProvidedIds.UnionWith(other._ProvidedIds);
+                _ProvidedVersions.Clear();
+                foreach (var kv in other._ProvidedVersions) _ProvidedVersions[kv.Key] = kv.Value;
                 _Conflicts.Clear();
                 foreach (var kv in other._Conflicts) _Conflicts[kv.Key] = kv.Value;
+                _ConflictDeclarations.Clear();
+                foreach (var c in other._ConflictDeclarations)
+                    _ConflictDeclarations.Add(new EmbeddedConflict
+                        { Target = c.Target, Raw = c.Raw, Hard = c.Hard });
                 _EmbeddedMods = other._EmbeddedMods;
                 JijLoader = other.JijLoader;
                 JijTargetMcVersion = other.JijTargetMcVersion;
+                JijIdentifier = other.JijIdentifier;
+                JijVersionRange = other.JijVersionRange;
+                JijArtifactVersion = other.JijArtifactVersion;
                 DetectedLoader = other.DetectedLoader;
                 Logo = other.Logo;
                 Url = other.Url;
@@ -1161,13 +1242,19 @@ public static class ModLocalComp
             possibleModId = new List<string>();
             _Dependencies = new Dictionary<string, string>();
             _DependencyRaw.Clear();
+            _DependencyDeclarations.Clear();
             _OptionalDependencies.Clear();
             _RequiredDeclared.Clear();
             _ProvidedIds.Clear();
+            _ProvidedVersions.Clear();
             _Conflicts.Clear();
+            _ConflictDeclarations.Clear();
             _EmbeddedMods = new List<LocalCompFile>();
             JijLoader = null;
             JijTargetMcVersion = null;
+            JijIdentifier = null;
+            JijVersionRange = null;
+            JijArtifactVersion = null;
             DetectedLoader = null;
             isLoaded = false;
             _FileUnavailableReason = null;
@@ -1391,25 +1478,31 @@ public static class ModLocalComp
         internal bool JijPending => _jijPending;
 
         /// <summary>后台（Phase 2）补解析被延后的内嵌树：重开 jar 递归解析并写回缓存。仅对 <see cref="JijPending" /> 项有效。</summary>
-        internal void ResolveJijNow()
+        internal bool ResolveJijNow()
         {
-            if (!_jijPending) return;
-            ZipArchive jar = null;
-            try
+            lock (_loadLock)
             {
-                jar = new ZipArchive(new FileStream(path, FileMode.Open, FileAccess.Read,
-                    FileShare.Read | FileShare.Write | FileShare.Delete));
-                var tree = ModJarInJar.ResolveCached(path, jar, this);
-                if (tree is not null) _EmbeddedMods = tree;
-            }
-            catch (Exception ex)
-            {
-                ModBase.Log(ex, "后台补解析内嵌模组失败（" + path + "）", ModBase.LogLevel.Developer);
-            }
-            finally
-            {
-                _jijPending = false;
-                jar?.Dispose();
+                if (!_jijPending) return true;
+                ZipArchive jar = null;
+                try
+                {
+                    jar = new ZipArchive(new FileStream(path, FileMode.Open, FileAccess.Read,
+                        FileShare.Read | FileShare.Write | FileShare.Delete));
+                    var tree = ModJarInJar.ResolveCached(path, jar, this);
+                    if (tree is null) return false;
+                    _EmbeddedMods = tree;
+                    _jijPending = false;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    ModBase.Log(ex, "后台补解析内嵌模组失败（" + path + "）", ModBase.LogLevel.Developer);
+                    return false;
+                }
+                finally
+                {
+                    jar?.Dispose();
+                }
             }
         }
 
@@ -1418,6 +1511,15 @@ public static class ModLocalComp
 
         /// <summary>内嵌（Jar-in-Jar）子项声明的目标 Minecraft 版本范围；仅内嵌项有值。</summary>
         public string JijTargetMcVersion { get; internal set; }
+
+        /// <summary>Forge JarJar 坐标（group:artifact）。</summary>
+        public string JijIdentifier { get; internal set; }
+
+        /// <summary>Forge JarJar 协商版本范围。</summary>
+        public string JijVersionRange { get; internal set; }
+
+        /// <summary>Forge JarJar 实际打包版本。</summary>
+        public string JijArtifactVersion { get; internal set; }
 
         /// <summary>本 Mod 检出的加载器（Fabric/Quilt/Forge/NeoForge），供依赖版本约束按方言求值；null=未知。</summary>
         public string DetectedLoader { get; internal set; }
@@ -1823,13 +1925,21 @@ public static class ModLocalComp
                                 Authors = tomlData[0].Value["authors"].ToString();
 
                             var ownModIdL = ModId.ToLower();
-                            var jarModIds = tomlData
+                            var jarMods = tomlData
                                 .Where(s => s.Key == "mods" && s.Value.ContainsKey("modId"))
-                                .Select(s => s.Value["modId"].ToString().ToLower())
+                                .Select(s => (Id: s.Value["modId"].ToString().ToLower(),
+                                    Version: s.Value.ContainsKey("version") ? s.Value["version"].ToString() : null))
+                                .GroupBy(m => m.Id, StringComparer.OrdinalIgnoreCase)
+                                .ToDictionary(g => g.Key, g => g.First().Version, StringComparer.OrdinalIgnoreCase);
+                            var jarModIds = jarMods.Keys
                                 .ToHashSet();
                             foreach (var sib in jarModIds)
                                 if (sib != ownModIdL)
+                                {
                                     _ProvidedIds.Add(sib);
+                                    if (!string.IsNullOrWhiteSpace(jarMods[sib]))
+                                        _ProvidedVersions[sib] = jarMods[sib];
+                                }
                             var sectionHadDeps = false;
                             foreach (var subData in tomlData)
                             {
@@ -1884,17 +1994,22 @@ public static class ModLocalComp
                                         var idMatch = Regex.Match(body, "modId\\s*=\\s*\"([^\"]+)\"",
                                             RegexOptions.IgnoreCase);
                                         if (!idMatch.Success) continue;
-                                        if (Regex.IsMatch(body, "\"(incompatible|discouraged)\"",
-                                                RegexOptions.IgnoreCase) ||
-                                            Regex.IsMatch(body, "side\\s*=\\s*\"server\"", RegexOptions.IgnoreCase))
+                                        if (Regex.IsMatch(body, "side\\s*=\\s*\"server\"", RegexOptions.IgnoreCase))
                                             continue;
+                                        var typeMatch = Regex.Match(body,
+                                            "type\\s*=\\s*\"(incompatible|discouraged|optional|required)\"",
+                                            RegexOptions.IgnoreCase);
+                                        var type = typeMatch.Success ? typeMatch.Groups[1].Value.ToLower() : null;
                                         var optional =
                                             Regex.IsMatch(body, @"mandatory\s*=\s*""?false", RegexOptions.IgnoreCase) ||
-                                            Regex.IsMatch(body, "type\\s*=\\s*\"optional\"", RegexOptions.IgnoreCase);
+                                            type == "optional";
                                         var vr = Regex.Match(body, "versionRange\\s*=\\s*\"([^\"]+)\"",
                                             RegexOptions.IgnoreCase);
-                                        AddDependency(idMatch.Groups[1].Value, vr.Success ? vr.Groups[1].Value : null,
-                                            optional);
+                                        var range = vr.Success ? vr.Groups[1].Value : null;
+                                        if (type is "incompatible" or "discouraged")
+                                            _AddConflict(idMatch.Groups[1].Value, range, type == "incompatible");
+                                        else
+                                            AddDependency(idMatch.Groups[1].Value, range, optional);
                                     }
 
                             // 加载成功，跳转到完成标签
@@ -2261,20 +2376,30 @@ public static class ModLocalComp
     // 后台内嵌解析（Phase 2）是否已全部完成；false 时级联反查可能遗漏内嵌依赖，禁用/删除前应提示。
     internal static volatile bool CompJijResolved = true;
 
+    // 每次启动 Mod 列表解析递增。后台任务只有仍属于最新一轮时才可发布完成状态，
+    // 避免旧实例/旧重载的 finally 把新一轮尚未完成的状态覆盖成 true。
+    private static int _jijGeneration;
+
     // Phase 2：列表出现后在后台线程补解析被延后的内嵌树，完成后清理+落盘缓存
     private static void _ResolveJijPendingBackground(List<LocalCompFile> pending, List<string> allModPaths,
-        string instancePath)
+        string instancePath, int loaderTaskId, int generation)
     {
         ModJarInJarCache.UseInstance(instancePath); // [ThreadStatic]：后台线程须重新注册目标实例缓存
+        var allResolved = false;
         try
         {
             foreach (var m in pending)
             {
-                if (compResourceListLoader.IsAborted) return; // 列表被重新加载：放弃本轮补解析
+                // 当前运行在 RunInNewThread 创建的普通 Thread 上，Task.CurrentId 为 null；
+                // 必须使用来源加载任务的 Task Id 判断，不能调用 IsAborted。
+                if (compResourceListLoader.IsAbortedWithThread(loaderTaskId)) return;
                 m.ResolveJijNow();
             }
 
-            ModJarInJarCache.Prune(allModPaths);
+            if (compResourceListLoader.IsAbortedWithThread(loaderTaskId)) return;
+            // 个别文件解析失败时保留其 pending 状态与旧缓存条目，等待下一次强制刷新重试。
+            allResolved = pending.All(m => !m.JijPending);
+            if (allResolved) ModJarInJarCache.Prune(allModPaths);
             ModJarInJarCache.Flush();
         }
         catch (Exception ex)
@@ -2284,9 +2409,12 @@ public static class ModLocalComp
         finally
         {
             ModJarInJarCache.UseInstance(null);
-            CompJijResolved = true;
-            // 内嵌解析补齐后，若关系页正显示则刷新（pending 期间打开会看到空内嵌）
-            ModBase.RunInUi(() => ModMain.frmInstanceModJarInJar?.OnJijResolved());
+            if (generation == Volatile.Read(ref _jijGeneration))
+            {
+                CompJijResolved = allResolved;
+                // 内嵌解析状态变化后，若关系页正显示则刷新；失败时仍保留“未完成”保护。
+                ModBase.RunInUi(() => ModMain.frmInstanceModJarInJar?.OnJijResolved());
+            }
         }
     }
 
@@ -2431,10 +2559,12 @@ public static class ModLocalComp
             // 仅 Mod 类型启用 Jar-in-Jar 缓存；资源包/光影/投影共用同一 loader，不能用其路径污染/剪裁 mod 缓存
             var jijEnabled = loader.input.compType == CompType.Mod;
             var jijInstancePath = jijEnabled ? loader.input.gameVersion.PathInstance : null;
+            var jijGeneration = 0;
             ModJarInJarCache.UseInstance(jijInstancePath);
             // Phase 1：缓存未命中的内嵌解析延后到后台，让列表尽快出现（完成前禁用/删除级联会提示不完整）
             if (jijEnabled)
             {
+                jijGeneration = Interlocked.Increment(ref _jijGeneration);
                 CompJijResolved = false;
                 DeferJijOnMiss = true;
             }
@@ -2482,13 +2612,15 @@ public static class ModLocalComp
                     // 全部命中缓存：无需后台补解析，直接清理+落盘
                     ModJarInJarCache.Prune(allModPaths);
                     ModJarInJarCache.Flush();
-                    CompJijResolved = true;
+                    if (jijGeneration == Volatile.Read(ref _jijGeneration)) CompJijResolved = true;
                 }
                 else
                 {
                     // 冷缓存：内嵌解析（解压嵌套 jar）移到列表出现之后的后台线程；完成后清理+落盘并置 CompJijResolved
+                    var loaderTaskId = Task.CurrentId ?? -1;
                     ModBase.RunInNewThread(
-                        () => _ResolveJijPendingBackground(pending, allModPaths, jijInstancePath),
+                        () => _ResolveJijPendingBackground(pending, allModPaths, jijInstancePath, loaderTaskId,
+                            jijGeneration),
                         "Jar-in-Jar 后台解析");
                 }
             }

@@ -1944,7 +1944,8 @@ public partial class PageInstanceCompResource : IRefreshable
             switch (choice)
             {
                 case 1:
-                    EDModsCore(affected, false);
+                    // 只有全部依赖者都成功禁用后才删除 provider；否则会违背用户选择并留下启用但缺前置的 Mod。
+                    if (!EDModsCore(affected, false)) return;
                     break;
                 case 2:
                     list = list.Concat(affected).ToList();
@@ -1994,12 +1995,34 @@ public partial class PageInstanceCompResource : IRefreshable
             Lang.Text("Common.Action.Confirm"), Lang.Text("Common.Action.Cancel"), true);
     }
 
-    private void EDModsCore(IEnumerable<ModLocalComp.LocalCompFile> modList, bool isEnable)
+    private bool EDModsCore(IEnumerable<ModLocalComp.LocalCompFile> modList, bool isEnable)
     {
         var isSuccessful = true;
         foreach (var ModE in modList)
         {
             var modEntity = ModE; // 仅用于去除迭代变量无法修改的限制
+            // 用户可能在 Phase 2 尚未完成时选择继续操作。重命名前先同步补齐该项，
+            // 否则后台仍持有旧路径实体，而新实体会复制空树并永久丢失本次会话的 JIJ 状态。
+            if (currentCompType == ModComp.CompType.Mod && modEntity.JijPending)
+            {
+                var resolved = false;
+                try
+                {
+                    ModJarInJarCache.UseInstance(PageInstanceLeft.McInstance?.PathInstance);
+                    resolved = modEntity.ResolveJijNow();
+                    if (resolved) ModJarInJarCache.Flush();
+                }
+                finally
+                {
+                    ModJarInJarCache.UseInstance(null);
+                }
+                if (!resolved)
+                {
+                    HintService.Hint(Lang.Text("Instance.Resource.Ed.ToggleFailed"), HintType.Error);
+                    isSuccessful = false;
+                    continue;
+                }
+            }
             string newPath = null;
             if (modEntity.State == ModLocalComp.LocalCompFile.LocalFileStatus.Fine && !isEnable)
                 // 禁用
@@ -2044,12 +2067,13 @@ public partial class PageInstanceCompResource : IRefreshable
                     ModBase.LogLevel.Feedback,
                     userSummary: Lang.Text("Instance.Resource.Error.OperationFailed"));
                 ReloadCompFileList(true);
-                return;
+                return false;
             }
             catch (Exception ex)
             {
                 ModBase.Log(ex, $"重命名 Mod 失败（{modEntity.path ?? "null"}）");
                 isSuccessful = false;
+                continue;
             }
 
             // 更改 Loader 中的列表
@@ -2104,6 +2128,7 @@ public partial class PageInstanceCompResource : IRefreshable
         }
 
         LoaderRun(ModLoader.LoaderFolderRunType.UpdateOnly);
+        return isSuccessful;
     }
 
     // 更新
@@ -2386,6 +2411,7 @@ public partial class PageInstanceCompResource : IRefreshable
                         ModBase.LogLevel.Msgbox,
                         userSummary: Lang.Text("Instance.Resource.Error.OperationFailed"));
                     isSuccessful = false;
+                    continue;
                 }
 
                 // 取消选中

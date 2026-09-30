@@ -20,7 +20,7 @@ namespace PCL;
 public static class ModJarInJarCache
 {
     /// <summary>缓存数据结构变化时递增此值以令旧缓存失效（改动 JIJ 解析/节点字段后务必升此值）。</summary>
-    private const int FormatVersion = 9;
+    private const int FormatVersion = 11;
 
     // 缓存落盘为 gzip 压缩的紧凑 JSON（.bin）：省略缩进/空集合/空字段后再压缩，
     // 相比美化 JSON 体积降至约 1/15（几百 mod 的实例从 300+KB 降到 ~20KB）。
@@ -247,11 +247,8 @@ public class EmbeddedModNode
     /// <summary>声明的目标 Minecraft 版本范围。</summary>
     public string TargetMcVersion { get; set; }
 
-    /// <summary>本内嵌 mod 声明的依赖（ModId → 原始版本约束），供其作为依赖方参与四态/级联分析。</summary>
-    public Dictionary<string, string> Dependencies { get; set; } = new();
-
-    /// <summary>其中被声明为可选的依赖 ModId 子集。</summary>
-    public List<string> OptionalDeps { get; set; } = new();
+    /// <summary>本内嵌 mod 的全部依赖声明；同一 ID 的不同范围/可选性分别保留。</summary>
+    public List<EmbeddedDependency> DependencyRows { get; set; } = new();
 
     /// <summary>本内嵌 mod 声明的冲突关系（对方 ModId + 生效版本约束 + 是否硬冲突）。</summary>
     public List<EmbeddedConflict> Conflicts { get; set; } = new();
@@ -259,7 +256,27 @@ public class EmbeddedModNode
     /// <summary>本内嵌 mod 额外提供的别名 id（multi-mod 兄弟 / Fabric provides）。</summary>
     public List<string> ProvidedIds { get; set; } = new();
 
+    /// <summary>具有独立版本的别名（主要是 Forge/NeoForge multi-mod JAR 的兄弟 mod）。</summary>
+    public Dictionary<string, string> ProvidedVersions { get; set; } = new();
+
+    /// <summary>Forge JarJar 坐标（group:artifact）；非 Forge JarJar 节点为空。</summary>
+    public string JijIdentifier { get; set; }
+
+    /// <summary>Forge JarJar 声明的协商版本范围。</summary>
+    public string JijVersionRange { get; set; }
+
+    /// <summary>Forge JarJar 实际打包的 artifactVersion。</summary>
+    public string JijArtifactVersion { get; set; }
+
     public List<EmbeddedModNode> Children { get; set; } = new();
+}
+
+/// <summary>可序列化的单条 Mod 依赖声明。</summary>
+public class EmbeddedDependency
+{
+    public string Id { get; set; }
+    public string Raw { get; set; }
+    public bool Optional { get; set; }
 }
 
 /// <summary>缓存中一条内嵌 mod 的冲突声明（用类而非元组以便 JSON 友好序列化）。</summary>

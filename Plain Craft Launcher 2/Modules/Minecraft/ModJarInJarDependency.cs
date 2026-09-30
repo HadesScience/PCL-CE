@@ -23,7 +23,7 @@ public static class ModDependencyIds
 {
     // 加载器/运行时平台伪 id：不作为真实 Mod 依赖收录。不含 minecraft（其版本要求另有用途）
     private static readonly HashSet<string> _loaderIds = new(StringComparer.OrdinalIgnoreCase)
-        { "forge", "neoforge", "fabric", "fabricloader", "quilt", "quilt_loader", "java", "mcp" };
+        { "forge", "neoforge", "fabricloader", "quilt", "quilt_loader", "java", "mcp" };
 
     /// <summary>是否加载器/平台伪 id（AddDependency 收录依赖时用；不含 minecraft）。</summary>
     public static bool IsLoaderId(string id) => _loaderIds.Contains(id);
@@ -61,36 +61,40 @@ public class ModJarInJarIndex
     public ModJarInJarIndex(IEnumerable<CompFile> allMods, string mc)
     {
         _allMods = allMods.Where(m => !m.IsFolder).ToList();
+        var preliminary = _allMods.ToDictionary(m => m, m => _CollectLoadableNodes(m.EmbeddedMods, mc));
+        var forgeSelections = _SelectForgeJarJarVersions(preliminary.Values.SelectMany(n => n));
         foreach (var m in _allMods)
         {
-            var nodes = _CollectLoadableNodes(m.EmbeddedMods, mc);
+            var nodes = _CollectLoadableNodes(m.EmbeddedMods, mc, forgeSelections);
             _loadableNodes[m] = nodes;
             _selfBundled[m] = nodes.Where(n => !string.IsNullOrEmpty(n.ModId))
                 .Select(n => (n.ModId, n.Version)).ToList();
 
             if (!string.IsNullOrEmpty(m.ModId)) _AddProvider(m.ModId, m, m.Version);
             foreach (var pid in m.ProvidedIds)
-                _AddProvider(pid, m, m.Version);
+                _AddProvider(pid, m,
+                    m.ProvidedVersions.TryGetValue(pid, out var providedVersion) ? providedVersion : m.Version);
             foreach (var n in nodes.Where(n => !string.IsNullOrEmpty(n.ModId)))
                 _AddProvider(n.ModId, m, n.Version);
             // 内嵌节点自身的别名(multi-mod 兄弟/provides)也由宿主提供
             foreach (var n in nodes)
             foreach (var pid in n.ProvidedIds)
-                _AddProvider(pid, m, n.Version);
+                _AddProvider(pid, m,
+                    n.ProvidedVersions.TryGetValue(pid, out var providedVersion) ? providedVersion : n.Version);
 
             var rows = new List<DepRow>();
-            foreach (var kv in m.DependencyRaw)
+            foreach (var declaration in m.DependencyDeclarations)
                 rows.Add(new DepRow
                 {
-                    DepId = kv.Key, Raw = kv.Value,
-                    Optional = m.OptionalDependencies.Contains(kv.Key), Loader = m.DetectedLoader
+                    DepId = declaration.Id, Raw = declaration.Raw,
+                    Optional = declaration.Optional, Loader = m.DetectedLoader
                 });
             foreach (var n in nodes)
-            foreach (var kv in n.DependencyRaw)
+            foreach (var declaration in n.DependencyDeclarations)
                 rows.Add(new DepRow
                 {
-                    DepId = kv.Key, Raw = kv.Value,
-                    Optional = n.OptionalDependencies.Contains(kv.Key), Loader = n.JijLoader
+                    DepId = declaration.Id, Raw = declaration.Raw,
+                    Optional = declaration.Optional, Loader = n.JijLoader
                 });
             _deps[m] = rows
                 .GroupBy(r => (r.DepId, r.Raw, r.Loader, r.Optional))
@@ -109,10 +113,10 @@ public class ModJarInJarIndex
 
     /// <summary>构造某 mod 自身声明的依赖行（不含内嵌上浮），供关系页按 mod 分卡展示。</summary>
     public static List<DepRow> BuildOwnDependencies(CompFile mod, string loader) =>
-        mod.DependencyRaw.Select(kv => new DepRow
+        mod.DependencyDeclarations.Select(declaration => new DepRow
         {
-            DepId = kv.Key, Raw = kv.Value,
-            Optional = mod.OptionalDependencies.Contains(kv.Key), Loader = loader
+            DepId = declaration.Id, Raw = declaration.Raw,
+            Optional = declaration.Optional, Loader = loader
         }).ToList();
 
     private static string _Norm(string id) => id?.Replace('-', '_');
@@ -126,7 +130,7 @@ public class ModJarInJarIndex
         var ver = McConstraintMatcher.StripV(providerVersion.Trim());
         if (ver.Length == 0 || !char.IsDigit(ver[0])) return true;
         if (McConstraintMatcher.Satisfies(dep.Raw, dep.Loader, ver)) return true;
-        return !McConstraintMatcher.HasComparableLowerBound(dep.Raw);
+        return !McConstraintMatcher.HasComparableBound(dep.Raw);
     }
 
     // 本 Mod 自己内嵌的副本是否满足该依赖的版本要求（内嵌了但版本不够时不算满足）
@@ -137,9 +141,11 @@ public class ModJarInJarIndex
                           _VersionSatisfies(dep, x.Version)))
             return true;
         // 同 jar 别名(multi-mod 兄弟/provides)由本文件提供，版本即宿主自身版本——否则 provider 过滤会把自己排除而误报缺失
-        return mod.ProvidedIds.Any(a =>
-                   string.Equals(_Norm(a), _Norm(dep.DepId), StringComparison.OrdinalIgnoreCase)) &&
-               _VersionSatisfies(dep, mod.Version);
+        foreach (var alias in mod.ProvidedIds)
+            if (string.Equals(_Norm(alias), _Norm(dep.DepId), StringComparison.OrdinalIgnoreCase))
+                return _VersionSatisfies(dep,
+                    mod.ProvidedVersions.TryGetValue(alias, out var version) ? version : mod.Version);
+        return false;
     }
 
     public static bool IsPlatform(string id) => ModDependencyIds.IsPlatform(id);
@@ -171,22 +177,22 @@ public class ModJarInJarIndex
         {
             if (m.State != CompFile.LocalFileStatus.Fine) continue;
             // 宿主自身冲突 + 各可加载内嵌节点冲突，声明方都归宿主(启用单位)，各按自己的 loader 方言判版本
-            _CollectConflicts(m, m.Conflicts, m.DetectedLoader, order, pairs);
+            _CollectConflicts(m, m.ConflictDeclarations, m.DetectedLoader, order, pairs);
             foreach (var n in _loadableNodes[m])
-                _CollectConflicts(m, n.Conflicts, n.JijLoader, order, pairs);
+                _CollectConflicts(m, n.ConflictDeclarations, n.JijLoader, order, pairs);
         }
 
         return pairs.Select(kv => (kv.Key.Item1, kv.Key.Item2, kv.Value)).ToList();
     }
 
     private void _CollectConflicts(CompFile declarer,
-        IReadOnlyDictionary<string, (string Raw, bool Hard)> conflicts, string loader,
+        IEnumerable<EmbeddedConflict> conflicts, string loader,
         Dictionary<CompFile, int> order, Dictionary<(CompFile, CompFile), bool> pairs)
     {
-        foreach (var kv in conflicts)
+        foreach (var conflict in conflicts)
         {
-            if (!_providers.TryGetValue(_Norm(kv.Key), out var provs)) continue;
-            var (range, hard) = kv.Value;
+            if (!_providers.TryGetValue(_Norm(conflict.Target), out var provs)) continue;
+            var (range, hard) = (conflict.Raw, conflict.Hard);
             foreach (var p in provs)
             {
                 if (p.Mod == declarer || p.Mod.State != CompFile.LocalFileStatus.Fine) continue;
@@ -258,27 +264,73 @@ public class ModJarInJarIndex
     #region MC 版本匹配
 
     // 递归收集"会加载"的内嵌节点：某副本 MC 约束不匹配当前实例则整支剪掉
-    private static List<CompFile> _CollectLoadableNodes(List<CompFile> embedded, string mc)
+    private static List<CompFile> _CollectLoadableNodes(List<CompFile> embedded, string mc,
+        IReadOnlyDictionary<string, string> forgeSelections = null)
     {
         var into = new List<CompFile>();
-        _Collect(embedded, mc, into);
+        _Collect(embedded, mc, into, forgeSelections);
         return into;
     }
 
-    private static void _Collect(List<CompFile> embedded, string mc, List<CompFile> into)
+    private static void _Collect(List<CompFile> embedded, string mc, List<CompFile> into,
+        IReadOnlyDictionary<string, string> forgeSelections)
     {
         if (embedded is null) return;
         foreach (var e in embedded)
         {
             if (!_NodeLoads(e, mc)) continue;
+            if (!_ForgeNodeSelected(e, forgeSelections)) continue;
             into.Add(e);
-            _Collect(e.EmbeddedMods, mc, into);
+            _Collect(e.EmbeddedMods, mc, into, forgeSelections);
         }
+    }
+
+    private static bool _ForgeNodeSelected(CompFile node, IReadOnlyDictionary<string, string> selections)
+    {
+        if (selections is null || string.IsNullOrWhiteSpace(node.JijIdentifier)) return true;
+        if (!selections.TryGetValue(node.JijIdentifier, out var selected) || selected is null) return false;
+        var version = node.JijArtifactVersion ?? node.Version;
+        return !string.IsNullOrWhiteSpace(version) &&
+               McConstraintMatcher.CompareMavenVersions(version, selected) == 0;
+    }
+
+    private static Dictionary<string, string> _SelectForgeJarJarVersions(IEnumerable<CompFile> nodes)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in nodes.Where(n => !string.IsNullOrWhiteSpace(n.JijIdentifier))
+                     .GroupBy(n => n.JijIdentifier, StringComparer.OrdinalIgnoreCase))
+        {
+            var candidates = group.Select(n => n.JijArtifactVersion ?? n.Version)
+                .Where(v => !string.IsNullOrWhiteSpace(v)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            candidates.Sort((a, b) => McConstraintMatcher.CompareMavenVersions(b, a));
+            result[group.Key] = candidates.FirstOrDefault(candidate => group.All(n =>
+                string.IsNullOrWhiteSpace(n.JijVersionRange) ||
+                _JarJarRangeContains(n.JijVersionRange, candidate)));
+        }
+        return result;
+    }
+
+    private static bool _JarJarRangeContains(string range, string candidate)
+    {
+        var value = range.Trim();
+        if (value.Length > 0 && value[0] is not '[' and not '(')
+            return McConstraintMatcher.CompareMavenVersions(candidate, value) == 0;
+        return McConstraintMatcher.Satisfies(value, "Forge", candidate);
     }
 
     private static bool _NodeLoads(CompFile node, string mc)
     {
         if (string.IsNullOrEmpty(mc)) return true; // 拿不到实例版本则不过滤
+        var declaredMc = node.DependencyDeclarations
+            .Where(d => string.Equals(d.Id, "minecraft", StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrWhiteSpace(d.Raw))
+            .ToList();
+        if (declaredMc.Count > 0)
+        {
+            if (declaredMc.All(d => McConstraintMatcher.Satisfies(d.Raw, node.JijLoader, mc))) return true;
+            return McConstraintMatcher.ContainsVersionToken(node.FileName, mc) ||
+                   McConstraintMatcher.ContainsVersionToken(node.Version, mc);
+        }
         var constraint = node.JijTargetMcVersion;
         if (string.IsNullOrWhiteSpace(constraint)) return true; // 无 MC 约束：任意版本均加载
         if (McConstraintMatcher.Satisfies(constraint, node.JijLoader, mc)) return true;
