@@ -1355,9 +1355,8 @@ public static class ModModpack
                     string tweakers = null;
                     JsonObject assetIndex = null;
                     string mainClass = null;
-                    int? javaMajorMin = null;
-                    int? javaMajorMax = null;
-                    JsonNode javaMajorsJson = null;
+                    List<int> javaMajorsSet = null;
+                    JsonArray javaMajorsJson = null;
                     var gameArguments = new JsonArray();
                     var jvmArguments = new JsonArray();
                     var libJson = new JsonArray();
@@ -1476,39 +1475,39 @@ public static class ModModpack
                                 .ToList();
                             if (majors.Count > 0)
                             {
-                                var majorMin = majors.Min();
-                                var majorMax = majors.Max();
-                                if (javaMajorMin is not null && javaMajorMax is not null)
+                                if (javaMajorsSet is not null)
                                 {
-                                    // 多个组件同时指定时取交集；若无交集，则以当前补丁的要求为准
-                                    var intersectMin = Math.Max(javaMajorMin.Value, majorMin);
-                                    var intersectMax = Math.Min(javaMajorMax.Value, majorMax);
-                                    if (intersectMin > intersectMax)
+                                    // 多个组件同时声明时取集合交集；若无交集，则以当前补丁的要求为准
+                                    var intersect = majors.Where(major => javaMajorsSet.Contains(major)).ToList();
+                                    if (intersect.Count == 0)
                                     {
-                                        ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 要求的 Java 主版本（{majorMin} - {majorMax}）" +
-                                                    $"与此前的要求（{javaMajorMin} - {javaMajorMax}）无交集，已使用当前补丁的要求");
+                                        ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 要求的 Java 主版本（{string.Join(", ", majors)}）" +
+                                                    $"与此前的要求（{string.Join(", ", javaMajorsSet)}）无交集，已使用当前补丁的要求");
+                                        javaMajorsSet = majors;
                                     }
                                     else
                                     {
-                                        majorMin = intersectMin;
-                                        majorMax = intersectMax;
+                                        javaMajorsSet = intersect;
                                     }
                                 }
+                                else
+                                {
+                                    javaMajorsSet = majors;
+                                }
 
-                                javaMajorMin = majorMin;
-                                javaMajorMax = majorMax;
-                                javaMajorsJson = patchJson["compatibleJavaMajors"]?.DeepClone();
                                 ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 兼容的 Java 主版本：" +
                                             string.Join(", ", majors));
                             }
                         }
                     }
 
-                    // Java 版本要求：以兼容范围的最低主版本作为最低要求，确保已安装的兼容 Java 能被自动选用
+                    // Java 版本要求：以兼容集合的最低主版本作为最低要求，确保已安装的兼容 Java 能被自动选用；
+                    // compatibleJavaMajors 按集合存储（含多补丁交集），启动时按成员资格挑选 Java
                     JsonObject javaVerJson = null;
-                    if (javaMajorMin is not null && javaMajorMax is not null)
+                    if (javaMajorsSet is not null && javaMajorsSet.Count > 0)
                     {
-                        string? javaComponent = javaMajorMin.Value switch
+                        var javaMajorMin = javaMajorsSet.Min();
+                        string? javaComponent = javaMajorMin switch
                         {
                             8 => "jre-legacy",
                             17 => "java-runtime-gamma",
@@ -1516,9 +1515,11 @@ public static class ModModpack
                             25 => "java-runtime-epsilon",
                             _ => null
                         };
-                        javaVerJson = new JsonObject { { "majorVersion", javaMajorMin.Value } };
+                        javaVerJson = new JsonObject { { "majorVersion", javaMajorMin } };
                         if (javaComponent is not null) javaVerJson.Add("component", javaComponent);
-                        ModBase.Log($"[ModPack] 整合包要求的 Java 主版本范围：{javaMajorMin} - {javaMajorMax}");
+                        javaMajorsJson = new JsonArray();
+                        foreach (var major in javaMajorsSet) javaMajorsJson.Add(major);
+                        ModBase.Log($"[ModPack] 整合包要求的 Java 主版本集合：{string.Join(", ", javaMajorsSet)}");
                     }
 
                     JsonObject jsonArguments = null;

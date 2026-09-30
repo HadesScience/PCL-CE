@@ -1017,7 +1017,9 @@ public static class ModLaunch
                 maxVer = new Version(999, 999, 999, 999);
         }
 
-        // JSON 中要求的兼容 Java 主版本范围（例如 MultiMC 整合包的 compatibleJavaMajors）
+        // compatibleJavaMajors 声明的兼容主版本集合（选择 Java 时按成员资格判断，而非连续区间）
+        IReadOnlySet<int> compatibleJavaMajorsSet = null;
+        // JSON 中要求的兼容 Java 主版本（例如 MultiMC 整合包的 compatibleJavaMajors）
         if (ModInstanceList.McMcInstanceSelected.JsonObject["compatibleJavaMajors"] is JsonArray compatibleMajors &&
             compatibleMajors.Count > 0)
         {
@@ -1030,10 +1032,13 @@ public static class ModLaunch
                 .ToList();
             if (majors.Count > 0)
             {
-                var compatibleMinVer = new Version(majors.Min(), 0, 0, 0);
-                var compatibleMaxVer = new Version(majors.Max(), 999, 999, 999);
+                static Version ToCompatibleVersion(int major, bool isMax) => major <= 8
+                    ? new Version(1, major, isMax ? 999 : 0, isMax ? 999 : 0)
+                    : new Version(major, isMax ? 999 : 0, isMax ? 999 : 0, isMax ? 999 : 0);
+                var compatibleMinVer = ToCompatibleVersion(majors.Min(), false);
+                var compatibleMaxVer = ToCompatibleVersion(majors.Max(), true);
                 if (ModBase.modeDebug)
-                    ModBase.Log("[Launch] [Debug] JSON 中要求的兼容 Java 主版本范围：" + majors.Min() + " - " + majors.Max());
+                    ModBase.Log("[Launch] [Debug] JSON 中要求的兼容 Java 主版本：" + string.Join(", ", majors));
                 // compatibleJavaMajors 具有最高优先级
                 // 先与其他规则取交集；若无交集（例如旧版本的 Java 8 上限规则），则直接采用 compatibleJavaMajors 声明的范围
                 var intersectMin = compatibleMinVer > minVer ? compatibleMinVer : minVer;
@@ -1046,14 +1051,20 @@ public static class ModLaunch
 
                 minVer = intersectMin;
                 maxVer = intersectMax;
+                // 记录原始集合：自动选择时按成员资格过滤，避免接受集合未声明的主版本（例如 [8, 17] 不接受 9 - 16）
+                compatibleJavaMajorsSet = majors.ToHashSet();
             }
         }
 
         lock (ModJava.javaLock)
         {
             // 选择 Java
-            McLaunchLog("Java 版本需求：最低 " + minVer + "，最高 " + maxVer);
-            mcLaunchJavaSelected = ModJava.JavaSelect("$$", minVer, maxVer, ModInstanceList.McMcInstanceSelected);
+            McLaunchLog("Java 版本需求：最低 " + minVer + "，最高 " + maxVer +
+                        (compatibleJavaMajorsSet is null
+                            ? ""
+                            : "，兼容主版本：" + string.Join(", ", compatibleJavaMajorsSet.OrderBy(major => major))));
+            mcLaunchJavaSelected = ModJava.JavaSelect("$$", minVer, maxVer, ModInstanceList.McMcInstanceSelected,
+                false, compatibleJavaMajorsSet);
             if (task.IsAborted)
                 return;
             if (mcLaunchJavaSelected is not null)
@@ -1121,7 +1132,8 @@ public static class ModLaunch
             }
 
             // 检查下载结果
-            mcLaunchJavaSelected = ModJava.JavaSelect("$$", minVer, maxVer, ModInstanceList.McMcInstanceSelected);
+            mcLaunchJavaSelected = ModJava.JavaSelect("$$", minVer, maxVer, ModInstanceList.McMcInstanceSelected,
+                false, compatibleJavaMajorsSet);
             if (task.IsAborted)
                 return;
             if (mcLaunchJavaSelected is not null)
