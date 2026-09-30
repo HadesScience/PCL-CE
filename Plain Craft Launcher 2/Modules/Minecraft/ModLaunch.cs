@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -999,7 +999,9 @@ public static class ModLaunch
         // JSON 中要求的版本
         if (ModInstanceList.McMcInstanceSelected.JsonObject["javaVersion"] is not null)
         {
-            var majorVersion = ModBase.Val(ModInstanceList.McMcInstanceSelected.JsonObject["javaVersion"]["majorVersion"]);
+            // Val 无法解析 JsonNode（会返回 0），必须先转为字符串
+            var majorVersion = ModBase.Val(ModInstanceList.McMcInstanceSelected.JsonObject["javaVersion"]["majorVersion"]
+                ?.ToString());
             if (ModBase.modeDebug)
                 ModBase.Log("[Launch] [Debug] JSON 中参数要求至少 Java " + majorVersion);
             if (majorVersion <= 8d)
@@ -1013,6 +1015,38 @@ public static class ModLaunch
 
             if (maxVer < minVer)
                 maxVer = new Version(999, 999, 999, 999);
+        }
+
+        // JSON 中要求的兼容 Java 主版本范围（例如 MultiMC 整合包的 compatibleJavaMajors）
+        if (ModInstanceList.McMcInstanceSelected.JsonObject["compatibleJavaMajors"] is JsonArray compatibleMajors &&
+            compatibleMajors.Count > 0)
+        {
+            var majors = compatibleMajors
+                // Val 无法解析 JsonNode（会返回 0），必须先转为字符串
+                .Select(major => (int)Math.Round(ModBase.Val(major?.ToString())))
+                .Where(major => major > 0)
+                .Distinct()
+                .OrderBy(major => major)
+                .ToList();
+            if (majors.Count > 0)
+            {
+                var compatibleMinVer = new Version(majors.Min(), 0, 0, 0);
+                var compatibleMaxVer = new Version(majors.Max(), 999, 999, 999);
+                if (ModBase.modeDebug)
+                    ModBase.Log("[Launch] [Debug] JSON 中要求的兼容 Java 主版本范围：" + majors.Min() + " - " + majors.Max());
+                // compatibleJavaMajors 具有最高优先级
+                // 先与其他规则取交集；若无交集（例如旧版本的 Java 8 上限规则），则直接采用 compatibleJavaMajors 声明的范围
+                var intersectMin = compatibleMinVer > minVer ? compatibleMinVer : minVer;
+                var intersectMax = compatibleMaxVer < maxVer ? compatibleMaxVer : maxVer;
+                if (intersectMax < intersectMin)
+                {
+                    intersectMin = compatibleMinVer;
+                    intersectMax = compatibleMaxVer;
+                }
+
+                minVer = intersectMin;
+                maxVer = intersectMax;
+            }
         }
 
         lock (ModJava.javaLock)

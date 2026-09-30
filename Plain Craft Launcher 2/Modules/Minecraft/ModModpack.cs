@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Text;
@@ -1309,7 +1309,11 @@ public static class ModModpack
         {
             packJson = (JsonObject)ModBase.GetJson(
                 ModBase.ReadFile(archive.GetEntry(archiveBaseFolder + "mmc-pack.json").Open(), Encoding.UTF8));
-            packInstance = ModBase.ReadFile(archive.GetEntry(archiveBaseFolder + "instance.cfg").Open(), Encoding.UTF8);
+            // 部分整合包不含 instance.cfg，此时会在后续流程中要求用户输入实例名
+            var instanceCfgEntry = archive.GetEntry(archiveBaseFolder + "instance.cfg");
+            packInstance = instanceCfgEntry is null
+                ? ""
+                : ModBase.ReadFile(instanceCfgEntry.Open(), Encoding.UTF8);
 
             #region JSON Patches
 
@@ -1318,14 +1322,17 @@ public static class ModModpack
             {
                 try
                 {
+                    // 部分压缩包不包含目录条目，因此按文件前缀匹配补丁，而不是依赖 "patches/" 目录项
                     if (!archive.Entries.Any(e =>
-                            e.FullName.Equals(archiveBaseFolder + "patches/", StringComparison.OrdinalIgnoreCase)))
+                            !e.FullName.EndsWith("/") &&
+                            e.FullName.StartsWith(archiveBaseFolder + "patches/", StringComparison.OrdinalIgnoreCase)))
                         break;
                     ModBase.Log("[ModPack] 安装的 MultiMC 整合包存在 JSON Patches");
                     // 排序预处理
                     var patches = new List<KeyValuePair<JsonObject, int>>();
                     foreach (var entry in archive.Entries)
-                        if (!entry.FullName.EndsWith("/") && entry.FullName.StartsWith(archiveBaseFolder + "patches/"))
+                        if (!entry.FullName.EndsWith("/") && entry.FullName.StartsWith(archiveBaseFolder + "patches/",
+                                StringComparison.OrdinalIgnoreCase))
                         {
                             var patch = (JsonObject)ModBase.GetJson(ModBase.ReadFile(
                                 archive.GetEntry(entry.FullName).Open(), Encoding.UTF8));
@@ -1347,8 +1354,10 @@ public static class ModModpack
 
                     string tweakers = null;
                     JsonObject assetIndex = null;
-                    JsonObject javaVerJson = null;
                     string mainClass = null;
+                    int? javaMajorMin = null;
+                    int? javaMajorMax = null;
+                    JsonNode javaMajorsJson = null;
                     var gameArguments = new JsonArray();
                     var jvmArguments = new JsonArray();
                     var libJson = new JsonArray();
@@ -1455,48 +1464,61 @@ public static class ModModpack
                         }
 
                         // Java 版本要求
-                        if (patchJson["compatibleJavaMajors"] is not null)
+                        // compatibleJavaMajors 表示该组件可以运行的所有 Java 主版本，安装后应能自动选用其中的版本
+                        if (patchJson["compatibleJavaMajors"] is JsonArray javaMajors && javaMajors.Count > 0)
                         {
-                            var javaVersion = 0;
-                            string javaComponent = null;
-                            var javaMajors = (JsonArray)patchJson["compatibleJavaMajors"];
-                            foreach (var Java in javaMajors)
+                            var majors = javaMajors
+                                // Val 无法解析 JsonNode（会返回 0），必须先转为字符串
+                                .Select(Java => (int)Math.Round(ModBase.Val(Java?.ToString())))
+                                .Where(major => major > 0)
+                                .Distinct()
+                                .OrderBy(major => major)
+                                .ToList();
+                            if (majors.Count > 0)
                             {
-                                if (javaVersion > ModBase.Val(Java))
-                                    continue;
-                                // 优先选择主要的版本
-                                if (ModBase.Val(Java) == 21d)
+                                var majorMin = majors.Min();
+                                var majorMax = majors.Max();
+                                if (javaMajorMin is not null && javaMajorMax is not null)
                                 {
-                                    javaVersion = 21;
-                                    javaComponent = "java-runtime-delta";
+                                    // 多个组件同时指定时取交集；若无交集，则以当前补丁的要求为准
+                                    var intersectMin = Math.Max(javaMajorMin.Value, majorMin);
+                                    var intersectMax = Math.Min(javaMajorMax.Value, majorMax);
+                                    if (intersectMin > intersectMax)
+                                    {
+                                        ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 要求的 Java 主版本（{majorMin} - {majorMax}）" +
+                                                    $"与此前的要求（{javaMajorMin} - {javaMajorMax}）无交集，已使用当前补丁的要求");
+                                    }
+                                    else
+                                    {
+                                        majorMin = intersectMin;
+                                        majorMax = intersectMax;
+                                    }
                                 }
-                                else if (ModBase.Val(Java) == 17d)
-                                {
-                                    javaVersion = 17;
-                                    javaComponent = "java-runtime-gamma";
-                                }
-                                else if (ModBase.Val(Java) == 11d)
-                                {
-                                    javaVersion = 11;
-                                    javaComponent = null;
-                                }
-                                else if (ModBase.Val(Java) == 8d)
-                                {
-                                    javaVersion = 8;
-                                    javaComponent = "jre-legacy";
-                                }
-                            }
 
-                            if (javaVersion == 0)
-                            {
-                                javaVersion = (int)javaMajors[0];
-                                javaComponent = null;
+                                javaMajorMin = majorMin;
+                                javaMajorMax = majorMax;
+                                javaMajorsJson = patchJson["compatibleJavaMajors"]?.DeepClone();
+                                ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 兼容的 Java 主版本：" +
+                                            string.Join(", ", majors));
                             }
-
-                            javaVerJson = new JsonObject { { "majorVersion", javaVersion } };
-                            if (javaComponent is not null) javaVerJson.Add("component", javaComponent);
-                            ModBase.Log($"[ModPack] JSON-Patch {patchJson["uid"]} 要求 Java 版本: " + javaVersion);
                         }
+                    }
+
+                    // Java 版本要求：以兼容范围的最低主版本作为最低要求，确保已安装的兼容 Java 能被自动选用
+                    JsonObject javaVerJson = null;
+                    if (javaMajorMin is not null && javaMajorMax is not null)
+                    {
+                        string? javaComponent = javaMajorMin.Value switch
+                        {
+                            8 => "jre-legacy",
+                            17 => "java-runtime-gamma",
+                            21 => "java-runtime-delta",
+                            25 => "java-runtime-epsilon",
+                            _ => null
+                        };
+                        javaVerJson = new JsonObject { { "majorVersion", javaMajorMin.Value } };
+                        if (javaComponent is not null) javaVerJson.Add("component", javaComponent);
+                        ModBase.Log($"[ModPack] 整合包要求的 Java 主版本范围：{javaMajorMin} - {javaMajorMax}");
                     }
 
                     JsonObject jsonArguments = null;
@@ -1525,12 +1547,15 @@ public static class ModModpack
                         packInfo.overridedJson.Add("assetIndex", assetIndex);
                     if (javaVerJson is not null)
                         packInfo.overridedJson.Add("javaVersion", javaVerJson);
+                    if (javaMajorsJson is not null)
+                        packInfo.overridedJson.Add("compatibleJavaMajors", javaMajorsJson);
                     if (libJson is not null)
                         packInfo.overridedJson.Add("libraries", libJson);
                 }
                 catch (Exception ex)
                 {
-                    ModBase.Log(ex, "应用 MMC JSON-Patches 失败");
+                    // JSON Patches 应用失败导致实例不完整，终止安装并报错
+                    throw new Exception("应用 MMC JSON-Patches 失败", ex);
                 }
             } while (false);
         }
@@ -1554,7 +1579,9 @@ public static class ModModpack
             throw new ModBase.CancelledException();
         // 解压
         var installTemp = ModMain.RequestTaskTempFolder();
-        var versionFolder = $@"{ModFolder.mcFolderSelected}versions\{instanceName}";
+        // 与 McInstance.PathInstance 及其余整合包流程保持一致（含末尾反斜杠），
+        // 否则此处写入的个性化设置（图标、JVM 参数、启动命令等）会与读取端使用不同的配置键，导致设置不生效
+        var versionFolder = $@"{ModFolder.mcFolderSelected}versions\{instanceName}\";
         var installLoaders = new List<LoaderBase>();
         installLoaders.Add(new LoaderTask<string, int>(Lang.Text("Minecraft.Download.Modpack.Stage.ExtractModpack"),
             task =>
@@ -1654,6 +1681,11 @@ public static class ModModpack
             }
 
             #endregion
+
+            // 立即刷新该实例的配置存储：将队列中的个性化设置（图标、JVM 参数等）同步落盘，
+            // 并让后续读取端基于最新文件内容重建缓存，避免写入延迟或进程退出时机导致设置丢失
+            ((PCL.Core.App.Configuration.Storage.DynamicCacheConfigStorage)PCL.Core.App.Configuration.ConfigService
+                .GetProvider(PCL.Core.App.Configuration.ConfigSource.GameInstance)).InvalidateCache(versionFolder);
         })
         {
             ProgressWeight = new FileInfo(fileAddress).Length / 1024d / 1024d / 6d,
