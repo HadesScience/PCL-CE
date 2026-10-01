@@ -472,15 +472,18 @@ public class ModJarInJarIndex
     {
         if (string.IsNullOrEmpty(mc)) return true;
         var declaredMc = node.DependencyDeclarations
-            .Where(d => string.Equals(d.Id, "minecraft", StringComparison.OrdinalIgnoreCase) &&
-                        !string.IsNullOrWhiteSpace(d.Raw))
+            .Where(d => string.Equals(d.Id, "minecraft", StringComparison.OrdinalIgnoreCase))
             .ToList();
-        if (declaredMc.Count > 0)
+        var requiredMc = declaredMc.Where(d => !d.Optional).ToList();
+        if (requiredMc.Count > 0)
         {
-            if (declaredMc.All(d => McConstraintMatcher.Satisfies(d.Raw, node.JijLoader, mc))) return true;
+            var constrained = requiredMc.Where(d => !string.IsNullOrWhiteSpace(d.Raw)).ToList();
+            if (constrained.Count == 0 ||
+                constrained.All(d => McConstraintMatcher.Satisfies(d.Raw, node.JijLoader, mc))) return true;
             return McConstraintMatcher.ContainsVersionToken(node.FileName, mc) ||
                    McConstraintMatcher.ContainsVersionToken(node.Version, mc);
         }
+        if (declaredMc.Count > 0) return true;
         var constraint = node.JijTargetMcVersion;
         if (string.IsNullOrWhiteSpace(constraint)) return true;
         if (McConstraintMatcher.Satisfies(constraint, node.JijLoader, mc)) return true;
