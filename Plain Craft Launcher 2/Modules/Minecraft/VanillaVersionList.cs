@@ -21,7 +21,7 @@ internal static class VanillaVersionList
     [ModuleInitializer]
     internal static void Register()
     {
-        VanillaVersionIndex.SetEmbeddedReader(ReadEmbedded);
+        VanillaVersionIndex.SetEmbeddedReader(ReadLocal);
         VanillaVersionIndex.BeginRefresh = () => { _ = RefreshAsync(); };
     }
 
@@ -30,17 +30,21 @@ internal static class VanillaVersionList
         var uri = new Uri("pack://application:,,,/Plain Craft Launcher 2;component/Resources/versions.txt", UriKind.Absolute);
         using var stream = Application.GetResourceStream(uri)!.Stream;
         using var reader = new StreamReader(stream, Encoding.UTF8);
-        var ids = new List<string>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var raw in reader.ReadToEnd().Split('\r', '\n'))
-        {
-            if (raw.Length == 0) continue;
-            var id = raw.Trim();
-            if (id.Length == 0 || !seen.Add(id)) continue;
-            ids.Add(id);
-        }
+        return VanillaVersionCache.Parse(reader.ReadToEnd());
+    }
 
-        return ids;
+    private static string CachePath => Path.Combine(Paths.SharedLocalData, "versions.txt");
+
+    private static IReadOnlyList<string> ReadLocal()
+    {
+        var embedded = ReadEmbedded();
+        var cached = VanillaVersionCache.TryRead(CachePath);
+        if (cached is not null && cached.Count > embedded.Count)
+        {
+            ModBase.Log($"[Minecraft] 使用缓存的 versions 列表，共 {cached.Count} 个版本");
+            return cached;
+        }
+        return embedded;
     }
 
     public static Task RefreshAsync()
@@ -64,7 +68,17 @@ internal static class VanillaVersionList
             {
                 var ids = DownloadIds();
                 VanillaVersionIndex.Publish(ids);
-                ModBase.Log($"[Minecraft] versions 列表获取完成，共 {ids.Count} 个版本");
+                try
+                {
+                    VanillaVersionCache.Write(CachePath, ids);
+                    ModBase.Log($"[Minecraft] versions 列表获取完成，共 {ids.Count} 个版本，已更新缓存");
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    ModBase.Log(ex, "[Minecraft] versions 列表获取完成，但写入缓存失败，已保留原缓存",
+                        ModBase.LogLevel.Normal);
+                }
+
                 return;
             }
             catch (Exception ex) when (ex is HttpRequestException or JsonException or OperationCanceledException)

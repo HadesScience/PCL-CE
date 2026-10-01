@@ -70,14 +70,14 @@ public sealed class VanillaVersionIndex
 
     public static VanillaVersionIndex? Current => Volatile.Read(ref _current);
 
-    /// <summary>由启动器注册。尚未发布索引时，Capture 用它同步读内嵌列表。</summary>
+    /// <summary>由启动器注册。尚未发布索引时，Capture 用它同步读本地列表。</summary>
     public static void SetEmbeddedReader(Func<IReadOnlyList<string>> reader) =>
         Volatile.Write(ref _embeddedReader, reader);
 
     /// <summary>由启动器注册。生命周期服务调用它在后台刷新索引，不阻塞启动。</summary>
     public static Action? BeginRefresh;
 
-    /// <summary>当前快照。尚未发布时同步读取内嵌列表并发布，不覆盖已经发布的快照。</summary>
+    /// <summary>当前快照。尚未发布时同步读取已注册的本地列表并发布，不覆盖已经发布的快照。</summary>
     public static VanillaVersionIndex? Capture()
     {
         var index = Volatile.Read(ref _current);

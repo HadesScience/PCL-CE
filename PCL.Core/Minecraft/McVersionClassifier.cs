@@ -38,13 +38,13 @@ public static class McVersionClassifier
         string? versionType = null)
     {
         if (string.IsNullOrEmpty(id)) return McVersionCategory.Unknown;
-        if (_IsAprilFoolsSnapshot(releaseTime, versionType) || _IsNamedAprilFools(id))
+        if (_IsAprilFoolsSnapshot(releaseTime, versionType) || id.StartsWith("2point0_", StringComparison.Ordinal))
             return McVersionCategory.AprilFools;
 
         var lower = id.ToLowerInvariant();
         if (line is int current && anchorLine is int anchor && current < anchor)
             return McVersionCategory.BeforeRelease;
-        if (lower.Contains("snapshot") || lower.Contains("rc") || lower.Contains("pre") || lower.Contains("combat") || _WeekSnapshot.IsMatch(lower))
+        if (lower.Contains("snapshot") || lower.Contains("rc") || lower.Contains("pre") || lower.Contains("combat") || _WeekSnapshot.IsMatch(lower) || lower.Contains("13w12~"))
             return McVersionCategory.Snapshot;
         if (lower.Contains('.')) return McVersionCategory.Release;
         return McVersionCategory.Unknown;
@@ -58,12 +58,6 @@ public static class McVersionClassifier
             return false;
         var shifted = time.ToUniversalTime().AddHours(2d);
         return shifted is { Month: 4, Day: 1 };
-    }
-
-    private static bool _IsNamedAprilFools(string id)
-    {
-        var lower = id.ToLowerInvariant();
-        return lower.StartsWith("2point0_", StringComparison.Ordinal) || lower == "13w12~";
     }
 
     public static McVersionCategory CategoryOf(JsonObject version)
