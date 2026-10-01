@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
@@ -11,8 +12,8 @@ namespace PCL;
 
 public partial class PageInstanceCompJarInJar
 {
-    private ModJarInJarIndex _index;
-    private string _instanceMc;
+    private ModJarInJarIndex _index = null!;
+    private string? _instanceMc;
     private string _search = "";
 
     public PageInstanceCompJarInJar()
@@ -35,25 +36,16 @@ public partial class PageInstanceCompJarInJar
         return _Contains(_DisplayName(m)) || _Contains(m.ModId) || _Contains(m.FileName);
     }
 
-    private bool _Contains(string s) =>
+    private bool _Contains(string? s) =>
         !string.IsNullOrEmpty(s) && s.IndexOf(_search, StringComparison.OrdinalIgnoreCase) >= 0;
 
-    private bool _AnyEmbeddedMatch(List<CompFile> embedded) =>
+    private bool _AnyEmbeddedMatch(List<CompFile>? embedded) =>
         embedded is not null && embedded.Any(e => _Match(e) || _AnyEmbeddedMatch(e.EmbeddedMods));
-
-    private IEnumerable<CompFile> _LoadableEmbedded(CompFile host)
-    {
-        foreach (var n in _index.GetLoadableEmbedded(host))
-            yield return n;
-    }
 
     private static void GoBack()
         => ModMain.frmInstanceLeft?.PageChange(FormMain.PageSubType.VersionMod);
 
-    /// <summary>
-    ///     后台内嵌解析（Phase 2）完成后由加载流程回调：仅当本页仍在显示时重建关系，
-    ///     补上此前 pending 期间打开所看到的空内嵌数据。非当前页则忽略（避免误触发 GoBack）。
-    /// </summary>
+    /// <summary>后台内嵌解析完成后刷新当前页。</summary>
     public void OnJijResolved()
     {
         if (IsVisible) RefreshList();
@@ -70,7 +62,9 @@ public partial class PageInstanceCompJarInJar
             return;
         }
 
-        var allMods = output.Where(m => !m.IsFolder).ToList();
+        var allMods = output
+            .Where(m => !m.IsFolder && m.State != CompFile.LocalFileStatus.Unavailable)
+            .ToList();
         _instanceMc = PageInstanceLeft.McInstance?.Info?.VanillaName;
         _index = new ModJarInJarIndex(allMods, _instanceMc);
         PanLoad.Visibility = Visibility.Collapsed;
@@ -78,9 +72,9 @@ public partial class PageInstanceCompJarInJar
         PanWarnList.Children.Clear();
         foreach (var host in allMods)
         {
-            if (host.State != CompFile.LocalFileStatus.Fine) continue; // 禁用的 mod 不加载，其缺失前置不算问题
+            if (host.State != CompFile.LocalFileStatus.Fine) continue;
             if (_Match(host)) _AppendMissingWarning(host, null, host.DetectedLoader);
-            foreach (var node in _LoadableEmbedded(host))
+            foreach (var node in _index.GetLoadableEmbedded(host))
                 if (_Match(node))
                     _AppendMissingWarning(node, host, node.JijLoader);
         }
@@ -92,7 +86,7 @@ public partial class PageInstanceCompJarInJar
         var conflictCount = 0;
         foreach (var (a, b, hard) in _index.FindActiveConflicts())
         {
-            if (!_Match(a) && !_Match(b)) continue; // 搜索过滤：任一方命中即显示
+            if (!_Match(a) && !_Match(b)) continue;
             PanConflictList.Children.Add(_MakeConflictRow(a, b, hard));
             conflictCount++;
         }
@@ -104,17 +98,17 @@ public partial class PageInstanceCompJarInJar
         foreach (var host in allMods)
         {
             var hostDeps = ModJarInJarIndex.BuildOwnDependencies(host, host.DetectedLoader)
-                .Where(d => !ModJarInJarIndex.IsPlatform(d.DepId)).ToList();
+                .Where(d => !ModDependencyIds.IsPlatform(d.DepId)).ToList();
             if (hostDeps.Count > 0 && (_Match(host) || hostDeps.Any(d => _Contains(d.DepId))))
             {
                 PanRelationList.Children.Add(_MakeRelationCard(host, null, hostDeps));
                 relationCount++;
             }
 
-            foreach (var node in _LoadableEmbedded(host))
+            foreach (var node in _index.GetLoadableEmbedded(host))
             {
                 var nodeDeps = ModJarInJarIndex.BuildOwnDependencies(node, node.JijLoader)
-                    .Where(d => !ModJarInJarIndex.IsPlatform(d.DepId)).ToList();
+                    .Where(d => !ModDependencyIds.IsPlatform(d.DepId)).ToList();
                 if (nodeDeps.Count == 0) continue;
                 if (!_Match(node) && !nodeDeps.Any(d => _Contains(d.DepId))) continue;
                 PanRelationList.Children.Add(_MakeRelationCard(node, host, nodeDeps));
@@ -139,9 +133,10 @@ public partial class PageInstanceCompJarInJar
                 : Visibility.Visible;
     }
 
-    private MyCard _MakeCard(CompFile mod, Action<StackPanel, CompFile> build)
+    private MyCard _MakeCard(CompFile mod, Action<StackPanel, CompFile> build, string? title = null)
     {
-        var card = new MyCard { Title = _DisplayName(mod), CanSwap = true, Margin = new Thickness(0, 0, 0, 10) };
+        var card = new MyCard
+            { Title = title ?? _DisplayName(mod), CanSwap = true, Margin = new Thickness(0, 0, 0, 10) };
         var stack = new StackPanel
         {
             Margin = new Thickness(20, MyCard.SwapedHeight, 18, 12),
@@ -155,15 +150,17 @@ public partial class PageInstanceCompJarInJar
         return card;
     }
 
-    private void _AppendMissingWarning(CompFile mod, CompFile parent, string loader)
+    private void _AppendMissingWarning(CompFile mod, CompFile? parent, string? loader)
     {
         var probed = ModJarInJarIndex.BuildOwnDependencies(mod, loader)
-            .Where(d => !ModJarInJarIndex.IsPlatform(d.DepId) && !d.Optional)
+            .Where(d => !ModDependencyIds.IsPlatform(d.DepId) && !d.Optional)
             .Select(d => (d, status: _index.Analyze(mod, d)))
             .ToList();
         var missing = probed.Where(x => x.status == JijDepStatus.Missing).Select(x => x.d.DepId).ToList();
         var mismatch = probed.Where(x => x.status == JijDepStatus.VersionMismatch)
-            .Select(x => x.d.Raw is null ? x.d.DepId : x.d.DepId + " " + x.d.Raw).ToList();
+            .Select(x => Lang.Text("Instance.Resource.Mod.JarInJar.Warning.VersionMismatch.Detail",
+                x.d.DepId, x.d.Raw ?? "*", string.Join(", ", _index.GetProviderVersions(mod, x.d.DepId))))
+            .ToList();
         // 版本匹配的 provider 全部被禁用：运行时同样不可用，需提示（用户重新启用即可修复）
         var disabled = probed.Where(x => x.status == JijDepStatus.Disabled).Select(x => x.d.DepId).ToList();
         if (missing.Count == 0 && mismatch.Count == 0 && disabled.Count == 0) return;
@@ -185,7 +182,6 @@ public partial class PageInstanceCompJarInJar
                 _BrushWarn));
     }
 
-    // 一条冲突：彩色级别标签（不兼容=红 / 不建议共存=橙）+「A 与 B」
     private Panel _MakeConflictRow(CompFile a, CompFile b, bool hard)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 2) };
@@ -200,36 +196,27 @@ public partial class PageInstanceCompJarInJar
         return row;
     }
 
-    private MyCard _MakeRelationCard(CompFile mod, CompFile parent, List<ModJarInJarIndex.DepRow> deps)
+    private MyCard _MakeRelationCard(CompFile mod, CompFile? parent, List<ModJarInJarIndex.DepRow> deps)
     {
         var title = parent is null
             ? _DisplayName(mod)
             : _DisplayName(mod) + "  " +
               Lang.Text("Instance.Resource.Mod.JarInJar.Bundled.From", _DisplayName(parent));
-        var card = new MyCard { Title = title, CanSwap = true, Margin = new Thickness(0, 0, 0, 10) };
-        var stack = new StackPanel
+        return _MakeCard(mod, (stack, owner) =>
         {
-            Margin = new Thickness(20, MyCard.SwapedHeight, 18, 12),
-            VerticalAlignment = VerticalAlignment.Top, RenderTransform = new TranslateTransform(0, 0),
-            Tag = mod
-        };
-        card.Children.Add(stack);
-        card.SwapControl = stack;
-        card.InstallMethod = s =>
-        {
-            foreach (var dep in deps) s.Children.Add(BuildDependencyRow(mod, dep));
-        };
-        card.IsSwapped = true;
-        return card;
+            foreach (var dep in deps) stack.Children.Add(BuildDependencyRow(owner, dep));
+        }, title);
     }
 
-    // 内嵌模组：仅展示内嵌树（禁用/删除请在模组列表进行，级联在那里统一处理）
     private void _BuildBundledContent(StackPanel stack, CompFile mod)
     {
-        AppendTreeRows(stack, mod.EmbeddedMods, 0);
+        var selected = mod.State == CompFile.LocalFileStatus.Fine
+            ? _index.GetLoadableEmbedded(mod).ToHashSet()
+            : new HashSet<CompFile>();
+        AppendTreeRows(stack, mod.EmbeddedMods, 0, selected);
     }
 
-    private void AppendTreeRows(StackPanel stack, List<CompFile> embedded, int depth)
+    private void AppendTreeRows(StackPanel stack, List<CompFile> embedded, int depth, HashSet<CompFile> selected)
     {
         if (embedded is null) return;
 
@@ -241,7 +228,7 @@ public partial class PageInstanceCompJarInJar
             if (versions.Count == 1)
             {
                 stack.Children.Add(BuildTreeRow(versions[0], depth, 0, McConstraintMatcher.MatchKind.None));
-                AppendTreeRows(stack, versions[0].EmbeddedMods, depth + 1);
+                AppendTreeRows(stack, versions[0].EmbeddedMods, depth + 1, selected);
                 continue;
             }
 
@@ -249,22 +236,27 @@ public partial class PageInstanceCompJarInJar
                 .Select(v => (v, kind: McConstraintMatcher.Match(v.FileName, v.Version, v.JijTargetMcVersion,
                     v.JijLoader, _instanceMc)))
                 .OrderByDescending(x => (int)x.kind).ToList();
-            var rep = scored[0].v;
+            var selectedRep = versions.FirstOrDefault(selected.Contains);
+            var rep = selectedRep ?? scored[0].v;
+            var kind = selectedRep is null
+                ? scored[0].kind
+                : McConstraintMatcher.Match(rep.FileName, rep.Version, rep.JijTargetMcVersion, rep.JijLoader,
+                    _instanceMc);
             var tooltip = string.Join("\n",
                 versions.Select(v => string.IsNullOrWhiteSpace(v.Version) ? v.FileName : v.Version));
-            stack.Children.Add(BuildTreeRow(rep, depth, versions.Count, scored[0].kind, tooltip));
-            AppendTreeRows(stack, rep.EmbeddedMods, depth + 1);
+            stack.Children.Add(BuildTreeRow(rep, depth, versions.Count, kind, tooltip, selectedRep is not null));
+            AppendTreeRows(stack, rep.EmbeddedMods, depth + 1, selected);
         }
 
         foreach (var e in ungrouped)
         {
             stack.Children.Add(BuildTreeRow(e, depth, 0, McConstraintMatcher.MatchKind.None));
-            AppendTreeRows(stack, e.EmbeddedMods, depth + 1);
+            AppendTreeRows(stack, e.EmbeddedMods, depth + 1, selected);
         }
     }
 
     private Panel BuildTreeRow(CompFile e, int depth, int versionCount, McConstraintMatcher.MatchKind kind,
-        string versionsTooltip = null)
+        string? versionsTooltip = null, bool selected = false)
     {
         var row = new StackPanel
         {
@@ -288,7 +280,7 @@ public partial class PageInstanceCompJarInJar
             row.Children.Add(badge);
         }
 
-        if (kind is McConstraintMatcher.MatchKind.Exact or McConstraintMatcher.MatchKind.Range)
+        if (selected || kind is McConstraintMatcher.MatchKind.Exact or McConstraintMatcher.MatchKind.Range)
             row.Children.Add(_Text("  " + Lang.Text("Instance.Resource.Mod.JarInJar.Bundled.Current"), _BrushOk));
         else if (kind == McConstraintMatcher.MatchKind.Incompatible)
             row.Children.Add(_Text("  " + Lang.Text("Instance.Resource.Mod.JarInJar.Bundled.Incompatible"),
@@ -341,13 +333,31 @@ public partial class PageInstanceCompJarInJar
     {
         var inst = PageInstanceLeft.McInstance;
         if (inst is null || output is null) return false;
-        var first = output.FirstOrDefault(m => !string.IsNullOrEmpty(m.path));
-        return first is null || first.path.StartsWith(inst.PathIndie, StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            var input = ModLocalComp.compResourceListLoader.input;
+            if (input is null || input.compType != ModComp.CompType.Mod ||
+                !string.Equals(Path.GetFullPath(input.gameVersion.PathInstance)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    Path.GetFullPath(inst.PathInstance)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase))
+                return false;
+            var first = output.FirstOrDefault(m => !string.IsNullOrEmpty(m.path));
+            if (first is null) return true;
+            var root = Path.GetFullPath(inst.PathIndie)
+                           .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                       Path.DirectorySeparatorChar;
+            return Path.GetFullPath(first.path).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
-    // 与模组列表卡片一致的名称显示：有在线工程信息时用 译名 | 原名，否则回退本地名/文件名
-    // 未替换的版本占位符（Forge ${file.jarVersion}、Fabric ${version} 等）不显示原文
-    private static string _CleanPlaceholder(string v) => string.IsNullOrEmpty(v) || v.Contains("${") ? null : v;
+    // 未替换的版本占位符不显示。
+    private static string? _CleanPlaceholder(string? v) => string.IsNullOrEmpty(v) || v.Contains("${") ? null : v;
 
     private static string _DisplayName(CompFile m)
     {

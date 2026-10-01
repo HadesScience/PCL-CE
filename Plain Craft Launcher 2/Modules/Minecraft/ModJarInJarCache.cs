@@ -10,20 +10,16 @@ using System.Text.Json.Serialization.Metadata;
 
 namespace PCL;
 
-/// <summary>
-///     内嵌模组（Jar-in-Jar）解析结果的持久化缓存。每实例一个文件，位于该实例的
-///     <c>PCL\JarInJar.bin</c>（gzip 压缩的紧凑 JSON，与 config.v1.yml 同级）。按 Mod 文件路径 + (最后修改时间, 大小) 指纹判断
-///     有效性，避免每次加载都重新递归解析嵌套 jar；也为后续依赖/级联分析提供可查询的内嵌索引。
-///     使用前须先 <see cref="UseInstance" /> 注册目标实例，用毕 <see cref="Flush" /> 落盘。
-///     "当前实例"按线程记录（<c>[ThreadStatic]</c>），模组列表加载与崩溃导出各自的线程互不干扰。
-/// </summary>
+/// <summary>每实例的 Jar-in-Jar 解析缓存，使用文件路径、修改时间和大小作为指纹。</summary>
 public static class ModJarInJarCache
 {
-    /// <summary>缓存数据结构变化时递增此值以令旧缓存失效（改动 JIJ 解析/节点字段后务必升此值）。</summary>
-    private const int FormatVersion = 11;
+    /// <summary>
+    ///     仅在持久化结构、编码或现有字段语义不兼容时递增 Major 并将 Minor 归零；
+    ///     只需强制重建缓存的解析逻辑调整递增 Minor。
+    /// </summary>
+    private const string FormatVersion = "8.3";
 
-    // 缓存落盘为 gzip 压缩的紧凑 JSON（.bin）：省略缩进/空集合/空字段后再压缩，
-    // 相比美化 JSON 体积降至约 1/15（几百 mod 的实例从 300+KB 降到 ~20KB）。
+    // 缓存落盘为 gzip 压缩的紧凑 JSON，并省略空字段与空集合。
     private static readonly JsonSerializerOptions _jsonOpts = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -31,7 +27,6 @@ public static class ModJarInJarCache
         TypeInfoResolver = new DefaultJsonTypeInfoResolver { Modifiers = { _DropEmptyCollections } }
     };
 
-    // 空集合（无依赖/无内嵌/无冲突等，占绝大多数节点）不写入，压缩前先削掉这部分体积
     private static void _DropEmptyCollections(JsonTypeInfo info)
     {
         foreach (var prop in info.Properties)
@@ -44,30 +39,26 @@ public static class ModJarInJarCache
 
     // 每线程各自的"当前实例"：列表加载线程与崩溃导出线程并发时互不干扰，
     // 避免一个线程 UseInstance 切走 _current 后，另一个线程路由回退写进错误实例的缓存
-    [ThreadStatic] private static _Store _current;
+    [ThreadStatic] private static _Store? _current;
 
     private class _Store
     {
-        public string InstancePath;
         public string CachePath;
         public Dictionary<string, CacheEntry> Entries; // null = 未加载
         public bool Dirty;
     }
 
-    public class CacheEntry
+    private class CacheEntry
     {
         public long LastModified { get; set; }
         public long Size { get; set; }
-
-        /// <summary>顶层 Mod 自身的关系元数据（ModId/版本/加载器/依赖/可选/冲突/别名），使缓存自包含、可纯离线做关系分析。</summary>
-        public EmbeddedModNode Self { get; set; }
 
         public List<EmbeddedModNode> Tree { get; set; } = new();
     }
 
     private class CacheFile
     {
-        public int Version { get; set; }
+        public string Version { get; set; }
         public Dictionary<string, CacheEntry> Entries { get; set; } = new();
     }
 
@@ -75,7 +66,7 @@ public static class ModJarInJarCache
     ///     注册并切换到某实例的缓存（<paramref name="instancePath" />\PCL\JarInJar.bin）。
     ///     传空表示后续路由不到的读写不走缓存。
     /// </summary>
-    public static void UseInstance(string instancePath)
+    public static void UseInstance(string? instancePath)
     {
         lock (_lock)
         {
@@ -90,7 +81,6 @@ public static class ModJarInJarCache
             {
                 store = new _Store
                 {
-                    InstancePath = key,
                     CachePath = Path.Combine(key, "PCL", "JarInJar.bin")
                 };
                 _stores[key] = store;
@@ -104,7 +94,6 @@ public static class ModJarInJarCache
     // 保留 .old（.old 可与新文件并存，剥了会键冲突）。
     private static string _NormalizeKey(string path)
     {
-        if (path is null) return null;
         return path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)
             ? path.Substring(0, path.Length - ".disabled".Length)
             : path;
@@ -121,15 +110,16 @@ public static class ModJarInJarCache
             using var gz = new GZipStream(fs, CompressionMode.Decompress);
             using var doc = JsonDocument.Parse(gz);
             var root = doc.RootElement;
-            // 格式版本不符：丢整表（避免旧结构的错值按指纹命中）
-            if (!root.TryGetProperty("Version", out var ver) || ver.GetInt32() != FormatVersion) return;
+            // 格式版本不符：丢整表（旧整数版本也会在此安全失效）
+            if (!root.TryGetProperty("Version", out var ver) || ver.ValueKind != JsonValueKind.String ||
+                ver.GetString() != FormatVersion) return;
             if (!root.TryGetProperty("Entries", out var entries) || entries.ValueKind != JsonValueKind.Object) return;
             // 逐条容错：单条损坏只丢那条，不丢整表
             foreach (var prop in entries.EnumerateObject())
                 try
                 {
                     var entry = prop.Value.Deserialize<CacheEntry>();
-                    if (entry is not null) store.Entries[prop.Name] = entry;
+                    if (entry is not null && _IsValidTree(entry.Tree)) store.Entries[prop.Name] = entry;
                 }
                 catch (Exception ex)
                 {
@@ -142,11 +132,34 @@ public static class ModJarInJarCache
         }
     }
 
+    private static bool _IsValidTree(List<EmbeddedModNode> tree)
+    {
+        if (tree is null) return false;
+        var pending = new Stack<(List<EmbeddedModNode> Nodes, int Depth)>();
+        pending.Push((tree, 1));
+        var count = 0;
+        while (pending.Count > 0)
+        {
+            var (nodes, depth) = pending.Pop();
+            if (depth > ModJarInJar.MaxDepth) return false;
+            foreach (var node in nodes)
+            {
+                if (node is null || string.IsNullOrWhiteSpace(node.FileName) ||
+                    node.DependencyRows is null || node.Conflicts is null || node.ProvidedIds is null ||
+                    node.ProvidedVersions is null || node.Children is null ||
+                    node.ProvidedIds.Any(string.IsNullOrWhiteSpace))
+                    return false;
+                if (++count > ModJarInJar.MaxNodes) return false;
+                if (node.Children.Count > 0) pending.Push((node.Children, depth + 1));
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>指纹匹配时返回缓存的内嵌树，否则返回 null。</summary>
     public static List<EmbeddedModNode> TryGet(string path, long lastModified, long size)
     {
-        // [ThreadStatic] 读取无需锁；未启用缓存的线程（如 UI 惰性加载）直接 bypass，
-        // 不必排队等别的线程在锁内做的读盘/落盘重 IO
         var store = _current;
         if (store is null) return null;
         lock (_lock)
@@ -159,7 +172,7 @@ public static class ModJarInJarCache
         }
     }
 
-    public static void Set(string path, long lastModified, long size, List<EmbeddedModNode> tree, EmbeddedModNode self)
+    public static void Set(string path, long lastModified, long size, List<EmbeddedModNode> tree)
     {
         var store = _current;
         if (store is null) return;
@@ -167,7 +180,7 @@ public static class ModJarInJarCache
         {
             _EnsureLoaded(store);
             store.Entries[_NormalizeKey(path)] =
-                new CacheEntry { LastModified = lastModified, Size = size, Self = self, Tree = tree };
+                new CacheEntry { LastModified = lastModified, Size = size, Tree = tree };
             store.Dirty = true;
         }
     }
@@ -219,8 +232,7 @@ public static class ModJarInJarCache
             }
 
             File.WriteAllBytes(tmp, bytes);
-            if (File.Exists(store.CachePath)) File.Delete(store.CachePath);
-            File.Move(tmp, store.CachePath);
+            File.Move(tmp, store.CachePath, true);
             // 清理旧版明文缓存（.json → .bin 迁移后残留）
             var legacy = Path.Combine(Path.GetDirectoryName(store.CachePath)!, "JarInJar.json");
             if (File.Exists(legacy)) File.Delete(legacy);
@@ -241,10 +253,8 @@ public class EmbeddedModNode
     public string Name { get; set; }
     public string Version { get; set; }
 
-    /// <summary>声明的加载器（Fabric/Quilt/Forge/NeoForge）。</summary>
     public string Loader { get; set; }
 
-    /// <summary>声明的目标 Minecraft 版本范围。</summary>
     public string TargetMcVersion { get; set; }
 
     /// <summary>本内嵌 mod 的全部依赖声明；同一 ID 的不同范围/可选性分别保留。</summary>
@@ -259,19 +269,15 @@ public class EmbeddedModNode
     /// <summary>具有独立版本的别名（主要是 Forge/NeoForge multi-mod JAR 的兄弟 mod）。</summary>
     public Dictionary<string, string> ProvidedVersions { get; set; } = new();
 
-    /// <summary>Forge JarJar 坐标（group:artifact）；非 Forge JarJar 节点为空。</summary>
     public string JijIdentifier { get; set; }
 
-    /// <summary>Forge JarJar 声明的协商版本范围。</summary>
     public string JijVersionRange { get; set; }
 
-    /// <summary>Forge JarJar 实际打包的 artifactVersion。</summary>
     public string JijArtifactVersion { get; set; }
 
     public List<EmbeddedModNode> Children { get; set; } = new();
 }
 
-/// <summary>可序列化的单条 Mod 依赖声明。</summary>
 public class EmbeddedDependency
 {
     public string Id { get; set; }
@@ -279,9 +285,9 @@ public class EmbeddedDependency
     public bool Optional { get; set; }
 }
 
-/// <summary>缓存中一条内嵌 mod 的冲突声明（用类而非元组以便 JSON 友好序列化）。</summary>
 public class EmbeddedConflict
 {
+    public string DeclarerId { get; set; }
     public string Target { get; set; }
     public string Raw { get; set; }
     public bool Hard { get; set; }

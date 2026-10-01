@@ -265,6 +265,7 @@ internal sealed class CrashReportExporter
         try
         {
             ModJarInJarCache.UseInstance(instance.PathInstance);
+            ModLocalComp.JijScanContext = new ModJarInJar.ScanContext();
             var modsFolderName = ModLocalComp.GetPathNameByCompType(ModComp.CompType.Mod);
             var modsFolder = instance.Info.HasLabyMod
                 ? Path.Combine(instance.PathIndie, "labymod-neo", "fabric", instance.Info.VanillaName, modsFolderName)
@@ -283,11 +284,13 @@ internal sealed class CrashReportExporter
             }
 
             var allMods = new List<ModLocalComp.LocalCompFile>();
+            var preferredLoader = ModLocalComp.GetPreferredLoader(instance);
             foreach (var folder in scanFolders)
                 foreach (var file in Directory.GetFiles(folder))
                 {
                     if (!ModLocalComp.LocalCompFile.IsModFile(file)) continue;
                     var mod = new ModLocalComp.LocalCompFile(file);
+                    mod.PreferredLoader = preferredLoader;
                     mod.Load();
                     if (mod.State != ModLocalComp.LocalCompFile.LocalFileStatus.Unavailable) allMods.Add(mod);
                 }
@@ -299,26 +302,26 @@ internal sealed class CrashReportExporter
 
             var sb = new StringBuilder();
 
-            // 依赖警告与冲突关系放在最前，崩溃排查时第一眼可见
             _AppendDependencyIssues(sb, jij, activeMods);
 
             var modsByModId = new Dictionary<string, List<ModLocalComp.LocalCompFile>>(StringComparer.OrdinalIgnoreCase);
             foreach (var mod in activeMods)
             {
-                if (string.IsNullOrEmpty(mod.ModId))
-                    continue;
-                if (!modsByModId.TryGetValue(mod.ModId, out var list))
-                    modsByModId[mod.ModId] = list = new List<ModLocalComp.LocalCompFile>();
-                list.Add(mod);
+                foreach (var id in new[] { mod.ModId }.Concat(mod.ProvidedIds).Where(id => !string.IsNullOrEmpty(id)))
+                {
+                    if (!modsByModId.TryGetValue(id, out var list))
+                        modsByModId[id] = list = new List<ModLocalComp.LocalCompFile>();
+                    if (!list.Contains(mod)) list.Add(mod);
+                }
             }
 
             var duplicates = new List<string>();
             foreach (var host in activeMods)
                 foreach (var embedded in jij.GetLoadableEmbedded(host))
+                foreach (var id in new[] { embedded.ModId }.Concat(embedded.ProvidedIds)
+                             .Where(id => !string.IsNullOrEmpty(id)))
                 {
-                    if (string.IsNullOrEmpty(embedded.ModId)
-                        || !modsByModId.TryGetValue(embedded.ModId, out var matches))
-                        continue;
+                    if (!modsByModId.TryGetValue(id, out var matches)) continue;
                     foreach (var other in matches)
                     {
                         if (ReferenceEquals(other, host))
@@ -381,13 +384,13 @@ internal sealed class CrashReportExporter
         }
         finally
         {
+            ModLocalComp.JijScanContext = null;
             // 复位本线程的"当前实例"：含 mods 目录不存在的 early return 与异常路径，
             // 否则本线程后续懒加载别实例的 Mod 会被路由进本实例缓存
             ModJarInJarCache.UseInstance(null);
         }
     }
 
-    // 把模组关系页的「缺失前置/版本不符」警告与「不兼容/不建议共存」冲突一并写入崩溃模组信息
     private static void _AppendDependencyIssues(StringBuilder sb, ModJarInJarIndex jij,
         List<ModLocalComp.LocalCompFile> activeMods)
     {
@@ -403,7 +406,7 @@ internal sealed class CrashReportExporter
             {
                 foreach (var d in ModJarInJarIndex.BuildOwnDependencies(who, loader))
                 {
-                    if (ModJarInJarIndex.IsPlatform(d.DepId) || d.Optional) continue;
+                    if (ModDependencyIds.IsPlatform(d.DepId) || d.Optional) continue;
                     switch (jij.Analyze(who, d))
                     {
                         case JijDepStatus.Missing:
@@ -413,7 +416,7 @@ internal sealed class CrashReportExporter
                             mismatch.Add(d.Raw is null ? d.DepId : d.DepId + " " + d.Raw);
                             break;
                         case JijDepStatus.Disabled:
-                            disabled.Add(d.DepId); // 版本匹配的 provider 全被禁用：运行时同样不可用
+                            disabled.Add(d.DepId);
                             break;
                     }
                 }
@@ -468,6 +471,6 @@ internal sealed class CrashReportExporter
     }
 
     // 未解析的版本占位符（如 Fabric ${version}、Forge ${file.jarVersion}）显示为空，避免裸 token
-    private static string _CleanVersion(string version)
+    private static string? _CleanVersion(string? version)
         => string.IsNullOrEmpty(version) || version.Contains("${") ? null : version;
 }

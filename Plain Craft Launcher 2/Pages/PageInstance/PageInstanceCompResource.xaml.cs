@@ -1910,8 +1910,7 @@ public partial class PageInstanceCompResource : IRefreshable
         ChangeAllSelected(false);
     }
 
-    /// <summary>启用/禁用 Mod。禁用时会检测依赖它的其它 Mod 并弹窗提示是否连带禁用（内嵌模组级联）。</summary>
-    public void EDMods(IEnumerable<ModLocalComp.LocalCompFile> modList, bool isEnable)
+    private void EDMods(IEnumerable<ModLocalComp.LocalCompFile> modList, bool isEnable)
     {
         var list = modList.ToList();
         if (!isEnable)
@@ -1929,8 +1928,7 @@ public partial class PageInstanceCompResource : IRefreshable
         EDModsCore(list, isEnable);
     }
 
-    /// <summary>删除 Mod。会检测依赖它的其它 Mod 并弹窗提示：仅删此项 / 连带禁用依赖者 / 连带删除依赖者。</summary>
-    public void DeleteMods(IEnumerable<ModLocalComp.LocalCompFile> modList)
+    private void DeleteMods(IEnumerable<ModLocalComp.LocalCompFile> modList)
     {
         // 在弹出任何模态框之前捕获 Shift（永久删除意图），否则选完档位时 Shift 多半已松开
         var isShiftPressed = Keyboard.IsKeyDown(Key.LeftShift) || Keyboard.IsKeyDown(Key.RightShift);
@@ -1944,10 +1942,11 @@ public partial class PageInstanceCompResource : IRefreshable
             switch (choice)
             {
                 case 1:
-                    // 只有全部依赖者都成功禁用后才删除 provider；否则会违背用户选择并留下启用但缺前置的 Mod。
                     if (!EDModsCore(affected, false)) return;
                     break;
                 case 2:
+                    // 先禁用依赖者；若后续删除部分失败，也不会留下启用但缺少前置的 Mod。
+                    if (!EDModsCore(affected, false)) return;
                     list = list.Concat(affected).ToList();
                     break;
             }
@@ -1960,17 +1959,44 @@ public partial class PageInstanceCompResource : IRefreshable
     private bool _ConfirmCascadeReady()
     {
         if (currentCompType != ModComp.CompType.Mod || ModLocalComp.CompJijResolved) return true;
-        return ModMain.MyMsgBox(
+        if (ModMain.MyMsgBox(
             Lang.Text("Instance.Resource.Mod.JarInJar.ParsePending.Message"),
             Lang.Text("Instance.Resource.Mod.JarInJar.ParsePending.Title"),
-            Lang.Text("Common.Action.Continue"), Lang.Text("Common.Action.Cancel"), isWarn: true) == 1;
+            Lang.Text("Common.Action.Continue"), Lang.Text("Common.Action.Cancel"), isWarn: true) != 1)
+            return false;
+
+        // “继续”表示先同步补齐整份列表，再重新构建级联索引；不能在残缺 output 上直接计算 affected。
+        var output = ModLocalComp.compResourceListLoader.output;
+        if (output is null) return false;
+        var completed = true;
+        try
+        {
+            ModJarInJarCache.UseInstance(PageInstanceLeft.McInstance?.PathInstance);
+            ModLocalComp.JijScanContext = new ModJarInJar.ScanContext();
+            foreach (var mod in output.Where(m => !m.IsFolder && m.JijPending))
+                completed &= mod.ResolveJijNow();
+            if (completed)
+            {
+                ModJarInJarCache.Prune(output.Where(m => !m.IsFolder).Select(m => m.path));
+                ModJarInJarCache.Flush();
+            }
+        }
+        finally
+        {
+            ModLocalComp.JijScanContext = null;
+            ModJarInJarCache.UseInstance(null);
+        }
+
+        ModLocalComp.CompJijResolved = completed;
+        ModMain.frmInstanceModJarInJar?.OnJijResolved();
+        if (!completed)
+            HintService.Hint(Lang.Text("Instance.Resource.Ed.ToggleFailed"), HintType.Error);
+        return completed;
     }
 
-    // 反查受影响的依赖者（仅 Mod 类型）；非 Mod 或无内嵌依赖返回空
     private List<ModLocalComp.LocalCompFile> _JijFindAffected(List<ModLocalComp.LocalCompFile> targets)
     {
         if (currentCompType != ModComp.CompType.Mod) return new List<ModLocalComp.LocalCompFile>();
-        // 列表尚未就绪则不做级联（不阻塞操作，也避免对 null 列表构建索引）
         var output = ModLocalComp.compResourceListLoader.output;
         if (output is null) return new List<ModLocalComp.LocalCompFile>();
         var index = new ModJarInJarIndex(output, PageInstanceLeft.McInstance?.Info?.VanillaName);
@@ -2009,11 +2035,13 @@ public partial class PageInstanceCompResource : IRefreshable
                 try
                 {
                     ModJarInJarCache.UseInstance(PageInstanceLeft.McInstance?.PathInstance);
+                    ModLocalComp.JijScanContext = new ModJarInJar.ScanContext();
                     resolved = modEntity.ResolveJijNow();
                     if (resolved) ModJarInJarCache.Flush();
                 }
                 finally
                 {
+                    ModLocalComp.JijScanContext = null;
                     ModJarInJarCache.UseInstance(null);
                 }
                 if (!resolved)
@@ -2045,6 +2073,7 @@ public partial class PageInstanceCompResource : IRefreshable
                             ModMain.MyMsgBox(
                                 Lang.Text("Instance.Resource.Ed.FileConflict.Message", newPath, modEntity.path),
                                 Lang.Text("Instance.Resource.Ed.FileConflict"));
+                            isSuccessful = false;
                             continue;
                         }
                     }

@@ -3,16 +3,10 @@ using System.Collections.Generic;
 
 namespace PCL;
 
-/// <summary>
-///     判断某版本是否满足一条依赖版本约束。按加载器方言分派：
-///     Forge/NeoForge = Maven 区间（<c>[a,b] [a,b) (a,b) [a,) (,b] [a]</c> 或裸 a=软下限）；
-///     Fabric/Quilt = SemVer 谓词（<c>||</c> OR、空格 AND、<c>&gt;= &gt; &lt;= &lt; =</c>、<c>x</c>/<c>*</c> 通配、尾 <c>-</c>）。
-///     哲学：宁可不标不可错标——任何拿不准的边界一律判不满足（fail-closed），比较统一走
-///     <see cref="McVersionComparer" /> 以正确处理快照/预发布/年份版本。
-/// </summary>
+/// <summary>按 Forge/NeoForge Maven 区间或 Fabric/Quilt SemVer 谓词求值版本约束。</summary>
 public static class McConstraintMatcher
 {
-    public static bool IsForgeLike(string loaderType) =>
+    private static bool IsForgeLike(string loaderType) =>
         string.Equals(loaderType, "Forge", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(loaderType, "NeoForge", StringComparison.OrdinalIgnoreCase);
 
@@ -71,115 +65,40 @@ public static class McConstraintMatcher
         }
     }
 
-    // 剥 SemVer build metadata（+ 及其后），供 semver 比较用
     private static string StripBuild(string s)
     {
         var i = s.IndexOf('+');
         return i < 0 ? s : s.Substring(0, i);
     }
 
-    // 剥版本号常见的前导 v/V（如 v0.5.1c → 0.5.1c）；仅在其后紧跟数字时剥
     public static string StripV(string s) =>
         s is { Length: > 1 } && (s[0] == 'v' || s[0] == 'V') && char.IsDigit(s[1]) ? s.Substring(1) : s;
 
-    // 比较两个版本，各自先剥前导 v
     private static int Cmp(string a, string b) => McVersionComparer.CompareVersion(StripV(a), StripV(b));
 
-    /// <summary>
-    ///     比较常见 Maven/Forge 版本。数字段按数值比较；限定符顺序为
-    ///     alpha &lt; beta &lt; milestone &lt; rc &lt; snapshot &lt; release &lt; sp。
-    /// </summary>
+    /// <summary>按 Maven ComparableVersion 规则比较版本。</summary>
     public static int CompareMavenVersions(string left, string right)
     {
-        var a = _TokenizeMaven(StripV(left?.Trim() ?? ""));
-        var b = _TokenizeMaven(StripV(right?.Trim() ?? ""));
-        var count = Math.Max(a.Count, b.Count);
-        for (var i = 0; i < count; i++)
+        left = StripV(left?.Trim() ?? "");
+        right = StripV(right?.Trim() ?? "");
+        try
         {
-            var x = i < a.Count ? a[i] : null;
-            var y = i < b.Count ? b[i] : null;
-            var c = _CompareMavenToken(x, y);
-            if (c != 0) return c;
+            return MavenComparableVersion.Compare(left, right);
         }
-
-        return 0;
+        catch (ArgumentException)
+        {
+            return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+        }
     }
 
-    private static List<string> _TokenizeMaven(string version)
+    /// <summary>Fabric 扩展 SemVer 排序；不符合 SemVer 的版本按规范回退为字典序。</summary>
+    public static int CompareFabricVersions(string left, string right)
     {
-        var result = new List<string>();
-        var current = "";
-        bool? digits = null;
-        foreach (var ch in version.ToLowerInvariant())
-        {
-            if (ch is '.' or '-' or '_' or '+')
-            {
-                if (current.Length > 0) result.Add(current);
-                current = "";
-                digits = null;
-                continue;
-            }
-
-            var isDigit = char.IsDigit(ch);
-            if (digits is not null && digits != isDigit)
-            {
-                if (current.Length > 0) result.Add(current);
-                current = "";
-            }
-
-            current += ch;
-            digits = isDigit;
-        }
-
-        if (current.Length > 0) result.Add(current);
-        return result;
-    }
-
-    private static int _CompareMavenToken(string left, string right)
-    {
-        var leftNumeric = left is not null && IsAllDigits(left);
-        var rightNumeric = right is not null && IsAllDigits(right);
-        if (leftNumeric && rightNumeric) return CompareNumericId(left, right);
-        if (leftNumeric) return CompareNumericId(left, "0") == 0
-            ? _CompareMavenQualifier("", right)
-            : 1;
-        if (rightNumeric) return CompareNumericId("0", right) == 0
-            ? _CompareMavenQualifier(left, "")
-            : -1;
-        return _CompareMavenQualifier(left ?? "", right ?? "");
-    }
-
-    private static int _CompareMavenQualifier(string left, string right)
-    {
-        static (int Rank, string Name) Normalize(string value)
-        {
-            value = value?.ToLowerInvariant() ?? "";
-            value = value switch
-            {
-                "a" => "alpha",
-                "b" => "beta",
-                "m" => "milestone",
-                "cr" => "rc",
-                "ga" or "final" or "release" => "",
-                _ => value
-            };
-            return value switch
-            {
-                "alpha" => (-5, ""),
-                "beta" => (-4, ""),
-                "milestone" => (-3, ""),
-                "rc" => (-2, ""),
-                "snapshot" => (-1, ""),
-                "" => (0, ""),
-                "sp" => (1, ""),
-                _ => (2, value)
-            };
-        }
-
-        var a = Normalize(left);
-        var b = Normalize(right);
-        var rank = a.Rank.CompareTo(b.Rank);
-        return rank != 0 ? rank : string.CompareOrdinal(a.Name, b.Name);
+        left = StripBuild(left?.Trim() ?? "");
+        right = StripBuild(right?.Trim() ?? "");
+        return IsKnown(left) && IsKnown(right)
+            ? CompareSemVer(left, right)
+            : string.CompareOrdinal(left, right);
     }
 
     /// <summary>
@@ -217,7 +136,6 @@ public static class McConstraintMatcher
         return false;
     }
 
-    // 版本串是否可比较（1.20.1 / 26.1 / 23w13a 数字开头，或 v0.5.1c 剥 v 后数字开头；剥掉 Fabric 尾 - 后判断）
     private static bool IsKnown(string s)
     {
         if (string.IsNullOrEmpty(s)) return false;
@@ -237,7 +155,7 @@ public static class McConstraintMatcher
 
             if (s[0] != '[' && s[0] != '(')
             {
-                if (IsKnown(s) && CompareMavenVersions(mc, s) >= 0) return true; // 裸版本=软下限
+                if (s.Length > 0 && CompareMavenVersions(mc, s) >= 0) return true; // 裸版本=软下限
                 continue;
             }
 
@@ -249,14 +167,12 @@ public static class McConstraintMatcher
             if (comma < 0)
             {
                 var only = body.Trim(); // [a] 精确
-                if (IsKnown(only) && CompareMavenVersions(mc, only) == 0) return true;
+                if (only.Length > 0 && CompareMavenVersions(mc, only) == 0) return true;
                 continue;
             }
 
             var loStr = body.Substring(0, comma).Trim();
             var hiStr = body.Substring(comma + 1).Trim();
-            if ((loStr.Length > 0 && !IsKnown(loStr)) || (hiStr.Length > 0 && !IsKnown(hiStr)))
-                continue; // 边界不可解析：整段判不满足（fail-closed）
             var ok = true;
             if (loStr.Length > 0)
             {
@@ -371,15 +287,14 @@ public static class McConstraintMatcher
         return x.Length != y.Length ? x.Length - y.Length : string.CompareOrdinal(x, y);
     }
 
-    // 空格 = AND，|| = OR，运算符 >= > <= < =，x/* 通配，尾 - 预发布标记
     private static bool SatisfiesSemVer(string constraint, string mc)
     {
-        foreach (var alt in constraint.Split(new[] { "||" }, StringSplitOptions.None)) // OR
+        foreach (var alt in constraint.Split(new[] { "||" }, StringSplitOptions.None))
         {
             var a = alt.Trim();
             if (a.Length == 0) continue;
             var all = true;
-            foreach (var term in a.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)) // AND
+            foreach (var term in a.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
                 if (!TermMatches(term, mc))
                 {
                     all = false;
@@ -415,7 +330,12 @@ public static class McConstraintMatcher
             var nums = new List<int>();
             var cur = -1;
             foreach (var ch in baseVer)
-                if (char.IsDigit(ch)) cur = (cur < 0 ? 0 : cur * 10) + (ch - '0');
+                if (char.IsDigit(ch))
+                {
+                    var digit = ch - '0';
+                    if (cur > (int.MaxValue - digit) / 10) return false;
+                    cur = (cur < 0 ? 0 : cur * 10) + digit;
+                }
                 else if (cur >= 0)
                 {
                     nums.Add(cur);
@@ -449,7 +369,8 @@ public static class McConstraintMatcher
             return mc == prefix || mc.StartsWith(prefix + ".", StringComparison.Ordinal);
         }
 
-        if (!IsKnown(ver)) return false; // 不可解析边界 fail-closed
+        if (!IsKnown(ver))
+            return (op is "" or "=" or "==") && string.Equals(mc, ver, StringComparison.Ordinal);
         if (prereleaseFloor && (op is "" or ">=" or ">") &&
             string.Equals(mc.Split('-')[0], ver, StringComparison.OrdinalIgnoreCase))
             return true;

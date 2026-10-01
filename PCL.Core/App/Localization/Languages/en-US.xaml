@@ -1100,9 +1100,9 @@
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Conflict.Pair">{0} and {1}</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Section.Relations">Mod relations</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Section.Bundled">Bundled mods</sys:String>
-    <sys:String x:Key="Instance.Resource.Mod.JarInJar.Section.Dependencies">Dependencies</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Warning.Missing">{0} is missing prerequisite(s): {1}</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Warning.VersionMismatch">{0} has version-incompatible prerequisite(s): {1}</sys:String>
+    <sys:String x:Key="Instance.Resource.Mod.JarInJar.Warning.VersionMismatch.Detail">{0} {1} (detected: {2})</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Warning.Disabled">{0} has disabled prerequisite(s): {1}</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Dep.Installed">Installed</sys:String>
     <sys:String x:Key="Instance.Resource.Mod.JarInJar.Dep.Disabled">Disabled</sys:String>
