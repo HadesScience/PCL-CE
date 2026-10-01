@@ -69,7 +69,7 @@ public class ModJarInJarIndex
         var forgeSelections = _SelectForgeJarJarVersions(preliminary.Values.SelectMany(n => n));
         var afterForge = activeMods.ToDictionary(m => m,
             m => _CollectLoadableNodes(m.EmbeddedMods, mc, forgeSelections));
-        var fabricSelections = _SelectFabricVersions(afterForge.Values.SelectMany(n => n));
+        var fabricSelections = _SelectFabricVersions(afterForge, mc, forgeSelections);
         foreach (var m in _allMods)
         {
             var nodes = m.State == CompFile.LocalFileStatus.Fine
@@ -366,35 +366,74 @@ public class ModJarInJarIndex
         return McConstraintMatcher.CompareFabricVersions(node.Version, selected) == 0;
     }
 
-    private Dictionary<string, string> _SelectFabricVersions(IEnumerable<CompFile> nodes)
+    private Dictionary<string, string> _SelectFabricVersions(
+        IReadOnlyDictionary<CompFile, List<CompFile>> nodesByHost, string mc,
+        IReadOnlyDictionary<string, string> forgeSelections)
     {
-        var list = nodes.ToList();
-        var requirements = new List<DepRow>();
+        var candidates = nodesByHost.Values.SelectMany(nodes => nodes).ToList();
+        var baseRequirements = new List<DepRow>();
         foreach (var mod in _allMods.Where(m => m.State == CompFile.LocalFileStatus.Fine))
         foreach (var declaration in mod.DependencyDeclarations.Where(d => !d.Optional))
-            requirements.Add(new DepRow
+            baseRequirements.Add(new DepRow
                 { DepId = declaration.Id, Raw = declaration.Raw, Loader = mod.DetectedLoader });
-        foreach (var node in list)
-        foreach (var declaration in node.DependencyDeclarations.Where(d => !d.Optional))
-            requirements.Add(new DepRow
-                { DepId = declaration.Id, Raw = declaration.Raw, Loader = node.JijLoader });
 
+        var result = _ChooseFabricVersions(candidates, baseRequirements);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var maxPasses = candidates.Count + 1;
+        for (var pass = 0; pass < maxPasses; pass++)
+        {
+            if (!seen.Add(_FabricSelectionKey(result)))
+            {
+                ModBase.Log("[Mod] Fabric 内嵌版本选择出现循环，保留当前候选并交由依赖检查报告冲突",
+                    ModBase.LogLevel.Developer);
+                return result;
+            }
+
+            var requirements = new List<DepRow>(baseRequirements);
+            foreach (var host in nodesByHost.Keys)
+            foreach (var node in _CollectLoadableNodes(host.EmbeddedMods, mc, forgeSelections, result))
+            foreach (var declaration in node.DependencyDeclarations.Where(d => !d.Optional))
+                requirements.Add(new DepRow
+                    { DepId = declaration.Id, Raw = declaration.Raw, Loader = node.JijLoader });
+
+            var next = _ChooseFabricVersions(candidates, requirements);
+            if (_SameFabricSelections(result, next)) return next;
+            result = next;
+        }
+
+        ModBase.Log("[Mod] Fabric 内嵌版本选择未在限定轮次内收敛，保留当前候选并交由依赖检查报告冲突",
+            ModBase.LogLevel.Developer);
+        return result;
+    }
+
+    private static Dictionary<string, string> _ChooseFabricVersions(
+        List<CompFile> candidates, List<DepRow> requirements)
+    {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var group in list.Where(n => !string.IsNullOrWhiteSpace(n.ModId) &&
-                                              (string.Equals(n.JijLoader, "Fabric", StringComparison.OrdinalIgnoreCase) ||
-                                               string.Equals(n.JijLoader, "Quilt", StringComparison.OrdinalIgnoreCase)))
+        foreach (var group in candidates.Where(n => !string.IsNullOrWhiteSpace(n.ModId) &&
+                                                    (string.Equals(n.JijLoader, "Fabric", StringComparison.OrdinalIgnoreCase) ||
+                                                     string.Equals(n.JijLoader, "Quilt", StringComparison.OrdinalIgnoreCase)))
                      .GroupBy(n => n.ModId, StringComparer.OrdinalIgnoreCase))
         {
-            var candidates = group.Select(n => n.Version).Where(v => !string.IsNullOrWhiteSpace(v))
+            var versions = group.Select(n => n.Version).Where(v => !string.IsNullOrWhiteSpace(v))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            candidates.Sort((a, b) => McConstraintMatcher.CompareFabricVersions(b, a));
+            versions.Sort((a, b) => McConstraintMatcher.CompareFabricVersions(b, a));
             var needed = requirements.Where(r => string.Equals(r.DepId, group.Key,
                 StringComparison.OrdinalIgnoreCase)).ToList();
-            result[group.Key] = candidates.FirstOrDefault(candidate => needed.All(r =>
+            result[group.Key] = versions.FirstOrDefault(candidate => needed.All(r =>
                 _VersionSatisfies(r, candidate)));
         }
         return result;
     }
+
+    private static bool _SameFabricSelections(IReadOnlyDictionary<string, string> left,
+        IReadOnlyDictionary<string, string> right) =>
+        left.Count == right.Count && left.All(pair => right.TryGetValue(pair.Key, out var value) &&
+            string.Equals(pair.Value, value, StringComparison.OrdinalIgnoreCase));
+
+    private static string _FabricSelectionKey(IReadOnlyDictionary<string, string> selections) =>
+        string.Join("\n", selections.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(pair => pair.Key + "\0" + pair.Value));
 
     private static bool _ForgeNodeSelected(CompFile node, IReadOnlyDictionary<string, string> selections)
     {
