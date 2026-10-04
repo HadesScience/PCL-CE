@@ -110,6 +110,40 @@ public sealed class ResourceUpdateRecycleBin
             return _TryReadRecord(updatedPath, out _, out _, out _);
     }
 
+    /// <summary>多选时跳过没有备份的资源；单个资源失败不影响其余资源。</summary>
+    public UndoBatchResult UndoMany(IEnumerable<string> updatedPaths)
+    {
+        var result = new UndoBatchResult();
+        lock (_SyncRoot)
+        {
+            foreach (var path in updatedPaths.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    if (!CanUndo(path))
+                    {
+                        result.SkippedPaths.Add(path);
+                        continue;
+                    }
+                    Undo(path);
+                    result.RestoredPaths.Add(path);
+                }
+                catch (Exception ex)
+                {
+                    result.Failures.Add(path, ex);
+                }
+            }
+        }
+        return result;
+    }
+
+    public sealed class UndoBatchResult
+    {
+        public List<string> RestoredPaths { get; } = new();
+        public List<string> SkippedPaths { get; } = new();
+        public Dictionary<string, Exception> Failures { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
     /// <summary>
     /// 先暂存新版，再还原旧版，最后彻底删除新版；还原失败时恢复新版。
     /// </summary>

@@ -212,6 +212,58 @@ public class ResourceUpdateRecycleBinTest
         Assert.AreEqual("old", File.ReadAllText(old));
     }
 
+    [TestMethod]
+    public void BulkUndoRestoresOnlyEligibleResourcesAndDeduplicatesSelection()
+    {
+        var oldMod = _Write("mods/mod-1.jar", "old mod");
+        var newMod = Path.Combine(_root, "mods/mod-2.jar");
+        _bin.Replace(oldMod, newMod, _Write("download/mod.jar", "new mod"));
+        var oldPack = _Write("resourcepacks/pack-1.zip", "old pack");
+        var newPack = Path.Combine(_root, "resourcepacks/pack-2.zip");
+        _bin.Replace(oldPack, newPack, _Write("download/pack.zip", "new pack"));
+        var untouched = _Write("mods/untouched.jar", "unchanged");
+
+        var result = _bin.UndoMany(new[] { newMod, untouched, newPack, newMod });
+        Assert.AreEqual(2, result.RestoredPaths.Count);
+        Assert.AreEqual(1, result.SkippedPaths.Count);
+        Assert.AreEqual(0, result.Failures.Count);
+        Assert.AreEqual("old mod", File.ReadAllText(oldMod));
+        Assert.AreEqual("old pack", File.ReadAllText(oldPack));
+        Assert.AreEqual("unchanged", File.ReadAllText(untouched));
+        Assert.IsFalse(File.Exists(newMod));
+        Assert.IsFalse(File.Exists(newPack));
+        Assert.IsFalse(_bin.CanUndo(oldMod));
+        Assert.IsFalse(_bin.CanUndo(oldPack));
+    }
+
+    [TestMethod]
+    public void BulkUndoContinuesAfterFailureAndPreservesFailedResource()
+    {
+        var blockedOld = _Write("shaderpacks/blocked-1.zip", "old shader");
+        var blockedNew = Path.Combine(_root, "shaderpacks/blocked-2.zip");
+        _bin.Replace(blockedOld, blockedNew, _Write("download/shader.zip", "new shader"));
+        File.WriteAllText(blockedOld, "another resource");
+        var old = _Write("mods/old.jar.disabled", "old mod");
+        var updated = Path.Combine(_root, "mods/new.jar.disabled");
+        _bin.Replace(old, updated, _Write("download/mod.jar", "new mod"));
+        var missingOld = _Write("mods/missing-1.jar", "old missing");
+        var missingNew = Path.Combine(_root, "mods/missing-2.jar");
+        _bin.Replace(missingOld, missingNew, _Write("download/missing.jar", "new missing"));
+        File.Delete(Path.Combine(_root, "recycle/mods/missing-1.jar"));
+
+        var result = _bin.UndoMany(new[] { blockedNew, missingNew, updated });
+        Assert.AreEqual(1, result.RestoredPaths.Count);
+        Assert.AreEqual(1, result.SkippedPaths.Count);
+        Assert.AreEqual(1, result.Failures.Count);
+        Assert.IsTrue(result.Failures.ContainsKey(blockedNew));
+        Assert.AreEqual("new shader", File.ReadAllText(blockedNew));
+        Assert.AreEqual("another resource", File.ReadAllText(blockedOld));
+        Assert.AreEqual("old shader", File.ReadAllText(Path.Combine(_root, "recycle/shaderpacks/blocked-1.zip")));
+        Assert.AreEqual("new missing", File.ReadAllText(missingNew));
+        Assert.AreEqual("old mod", File.ReadAllText(old));
+        Assert.IsTrue(_bin.CanUndo(blockedNew));
+    }
+
     private string _Write(string relativePath, string content)
     {
         var path = Path.Combine(_root, relativePath);
