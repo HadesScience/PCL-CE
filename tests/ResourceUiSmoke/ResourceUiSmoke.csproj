@@ -12,5 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="../../Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" />
     <EmbeddedResource Include="../../Plain Craft Launcher 2/metadata.json" LogicalName="PCL.metadata.json" />
+    <None Include="../../Plain Craft Launcher 2/Pages/PageInstance/PageInstanceCompResource.xaml" Link="Fixtures/Resources.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../Plain Craft Launcher 2/Pages/PageInstance/PageInstanceSaves/PageInstanceSavesDatapack.xaml" Link="Fixtures/Datapacks.xaml" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
