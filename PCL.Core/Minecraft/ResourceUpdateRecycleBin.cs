@@ -110,6 +110,48 @@ public sealed class ResourceUpdateRecycleBin
             return _TryReadRecord(updatedPath, out _, out _, out _);
     }
 
+    /// <summary>
+    /// 先暂存新版，再还原旧版，最后彻底删除新版；还原失败时恢复新版。
+    /// </summary>
+    public void Undo(string updatedPath)
+    {
+        lock (_SyncRoot)
+        {
+            if (!_TryReadRecord(updatedPath, out var record, out var originalPath, out var backupPath))
+                throw new IOException("没有找到该资源对应的旧版，或当前资源已被修改。");
+            updatedPath = _GetResourcePath(updatedPath);
+            if (!_SamePath(originalPath, updatedPath) && (File.Exists(originalPath) || Directory.Exists(originalPath)))
+                throw new IOException("旧版的原文件名已被占用，请先处理同名文件：" + originalPath);
+
+            var stagedPath = Path.Combine(Path.GetDirectoryName(updatedPath)!,
+                ".pcl-undo-" + Guid.NewGuid().ToString("N") + ".tmp");
+            var staged = false;
+            var restored = false;
+            try
+            {
+                File.Move(updatedPath, stagedPath);
+                staged = true;
+                File.Move(backupPath, originalPath);
+                restored = true;
+                File.Delete(stagedPath); // 用户要求撤回时彻底删除升级后的资源。
+            }
+            catch (Exception undoError)
+            {
+                try
+                {
+                    if (restored) File.Move(originalPath, backupPath);
+                    if (staged) File.Move(stagedPath, updatedPath);
+                }
+                catch (Exception restoreError)
+                {
+                    throw new AggregateException("撤回失败，请检查资源目录和软件内回收站。", undoError, restoreError);
+                }
+                throw;
+            }
+            _TryDeleteRecord(_GetRecordPath(Path.Combine(_GameDirectory, record.UpdatedPath)));
+        }
+    }
+
     private bool _TryReadRecord(string updatedPath, out UpdateRecord record, out string originalPath, out string backupPath)
     {
         record = null!;
