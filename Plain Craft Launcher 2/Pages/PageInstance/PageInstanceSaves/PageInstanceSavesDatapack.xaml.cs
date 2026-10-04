@@ -86,7 +86,7 @@ public partial class PageInstanceSavesDatapack : IRefreshable
         BtnSelectDisable.Click += BtnSelectDisable_Click;
         BtnSelectUpdate.Click += BtnSelectUpdate_Click;
         BtnSelectDelete.Click += BtnSelectDelete_Click;
-        BtnSelectUndo.Click += BtnSelectUndo_Click;
+        BtnSelectUndo.Click += _BtnSelectUndoClick;
         BtnSelectCancel.Click += BtnSelectCancel_Click;
         BtnSelectFavorites.Click += BtnSelectFavorites_Click;
         BtnSelectShare.Click += BtnSelectShare_Click;
@@ -488,7 +488,7 @@ public partial class PageInstanceSavesDatapack : IRefreshable
             }
 
             if (!selected) ResourceUpdateUndo.RefreshSelectionButton(BtnSelectUndo, 0, _undoingSelection);
-            UpdateSelectionMargin(selected);
+            _UpdateSelectionMargin(selected);
             // 更新显示状态
             if (ModAnimation.AniControlEnabled == 0)
             {
@@ -556,16 +556,16 @@ public partial class PageInstanceSavesDatapack : IRefreshable
     private int _refreshBarsRevision;
     private bool _undoingSelection;
 
-    private void UpdateSelectionMargin(bool selected)
+    private void _UpdateSelectionMargin(bool selected)
     {
         // 窄窗口换行后，列表底部为整张操作卡片预留空间。
         PanListBack.Margin = new Thickness(0, 0, 0, selected ? Math.Max(95, CardSelect.ActualHeight + 50) : 15);
     }
 
-    private void CardSelect_SizeChanged(object sender, SizeChangedEventArgs e) =>
-        UpdateSelectionMargin(selectedDatapacks.Count > 0);
+    private void _CardSelectSizeChanged(object sender, SizeChangedEventArgs e) =>
+        _UpdateSelectionMargin(selectedDatapacks.Count > 0);
 
-    private async void BtnSelectUndo_Click(object sender, ModBase.RouteEventArgs e)
+    private async void _BtnSelectUndoClick(object sender, ModBase.RouteEventArgs e)
     {
         if (_undoingSelection) return;
         var gameDirectory = PageInstanceLeft.McInstance.PathIndie;
