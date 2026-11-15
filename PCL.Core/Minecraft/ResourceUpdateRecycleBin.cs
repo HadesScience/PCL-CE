@@ -14,6 +14,8 @@ namespace PCL.Core.Minecraft;
 public sealed partial class ResourceUpdateRecycleBin
 {
     private static readonly object _SyncRoot = new();
+    // 各行与多选栏共享当前游戏目录的撤回索引，只缓存候选记录路径。
+    private static RecordIndex? _CachedRecordIndex;
     private readonly string _GameDirectory;
     private readonly string _RecycleDirectory;
 
@@ -54,7 +56,7 @@ public sealed partial class ResourceUpdateRecycleBin
             var backupPath = _GetContainedPath(_RecycleDirectory,
                 Path.Combine(_RecycleDirectory, Path.GetRelativePath(_GameDirectory, originalPath)));
             var recordPath = _GetRecordPath(updatedPath);
-            var previousRecordPath = _GetRecordPath(originalPath);
+            _TryReadRecord(originalPath, out _, out _, out _, out var previousRecordPath);
             Directory.CreateDirectory(Path.GetDirectoryName(backupPath)!);
             // 同名备份不能覆盖之前保留的旧版。
             while (File.Exists(backupPath) || Directory.Exists(backupPath))
@@ -104,7 +106,7 @@ public sealed partial class ResourceUpdateRecycleBin
                 throw;
             }
             // 连续更新只允许撤回最后一次，撤回后按钮应消失。
-            if (File.Exists(previousRecordPath) && !_SamePath(previousRecordPath, recordPath))
+            if (!string.IsNullOrEmpty(previousRecordPath) && !_SamePath(previousRecordPath, recordPath))
                 _Delete(previousRecordPath);
             // 安装已提交，缓存清理失败不能再将成功的更新报告为失败。
             try { _Delete(downloadedPath); }
