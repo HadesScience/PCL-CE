@@ -674,4 +674,128 @@ public class ResourceUpdateRecycleBinTest
         finally { Directory.Delete(linked); }
     }
 
+    [TestMethod]
+    public void NormalExternalDownloadCacheIsSupported()
+    {
+        var external = Path.Combine(Path.GetTempPath(), "PCL-Download-" + Guid.NewGuid().ToString("N") + ".jar");
+        File.WriteAllText(external, "new");
+        try
+        {
+            var old = _Write("mods/old.jar", "old");
+            var updated = Path.Combine(_root, "mods/new.jar");
+            _bin.Replace(old, updated, external);
+            Assert.IsFalse(File.Exists(external));
+            _bin.Undo(updated);
+            Assert.AreEqual("old", File.ReadAllText(old));
+            Assert.AreEqual(0, Directory.EnumerateFiles(Path.Combine(_root, "mods"), ".pcl-*").Count());
+        }
+        finally { File.Delete(external); }
+    }
+
+    [TestMethod]
+    public void InterruptedReplaceRemovesVerifiedLocalStagingFile()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var staged = _Write("mods/.pcl-update-" + Guid.NewGuid().ToString("N") + ".tmp", "new");
+        var record = new JsonObject
+        {
+            ["OriginalPath"] = "mods/old.jar", ["UpdatedPath"] = "mods/new.jar", ["BackupPath"] = "mods/old.jar",
+            ["OriginalHash"] = _Hash(old), ["UpdatedHash"] = _Hash(staged)
+        };
+        _WriteJournal(new JsonObject
+        {
+            ["Operation"] = "Replace", ["Record"] = record,
+            ["StagedPath"] = Path.GetRelativePath(_root, staged)
+        });
+        Directory.CreateDirectory(Path.Combine(_root, "recycle/mods"));
+        File.Move(old, Path.Combine(_root, "recycle/mods/old.jar"));
+        _bin.RecoverPendingOperations();
+        Assert.AreEqual("old", File.ReadAllText(old));
+        Assert.IsFalse(File.Exists(staged));
+    }
+
+    [TestMethod]
+    public void RecoveryRejectsRedirectedTransactionDirectory()
+    {
+        var target = Path.Combine(_root, "external");
+        Directory.CreateDirectory(target);
+        var sentinel = _Write("external/sentinel.json", "unchanged");
+        var linked = Path.Combine(_root, "recycle/.transactions");
+        Directory.CreateDirectory(Path.GetDirectoryName(linked)!);
+        _CreateJunction(linked, target);
+        try
+        {
+            Assert.Throws<IOException>(() => _bin.RecoverPendingOperations());
+            Assert.AreEqual("unchanged", File.ReadAllText(sentinel));
+        }
+        finally { Directory.Delete(linked); }
+    }
+
+    [TestMethod]
+    public void CorruptUnrelatedRecordDoesNotHideValidUndo()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        _Write("recycle/.records/broken.json", "{");
+        Assert.IsTrue(_bin.CanUndo(updated));
+        File.Move(updated, updated + ".disabled");
+        Assert.IsTrue(_bin.CanUndo(updated + ".disabled"));
+    }
+
+    [TestMethod]
+    public void InvalidPreviousRecordNameIsRejectedBeforeRecoveryWrites()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var recordPath = _GetRecordPath(updated);
+        var record = JsonNode.Parse(File.ReadAllText(recordPath))!;
+        File.Delete(recordPath);
+        var journal = _WriteJournal(new JsonObject
+        {
+            ["Operation"] = "Replace", ["Record"] = record,
+            ["PreviousRecordFile"] = "../unrelated.json"
+        });
+        Assert.Throws<IOException>(() => _bin.RecoverPendingOperations());
+        Assert.IsFalse(File.Exists(recordPath));
+        Assert.AreEqual("new", File.ReadAllText(updated));
+        Assert.AreEqual("old", File.ReadAllText(Path.Combine(_root, "recycle/mods/old.jar")));
+        Assert.IsTrue(File.Exists(journal));
+    }
+
+    [TestMethod]
+    [DataRow("Replace")]
+    [DataRow("Undo")]
+    public void RecoveryDoesNotDeleteUnrelatedUndoRecord(string operation)
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var unrelatedOld = _Write("mods/other-old.jar", "old");
+        var unrelatedUpdated = Path.Combine(_root, "mods/other-new.jar");
+        _bin.Replace(unrelatedOld, unrelatedUpdated, _Write("download/other.jar", "new"));
+        var record = JsonNode.Parse(File.ReadAllText(_GetRecordPath(updated)))!;
+        var unrelatedRecordPath = _GetRecordPath(unrelatedUpdated);
+        var unrelatedRecord = File.ReadAllText(unrelatedRecordPath);
+        var staged = Path.Combine(_root, "mods/.pcl-undo-" + Guid.NewGuid().ToString("N") + ".tmp");
+        var journal = _WriteJournal(new JsonObject
+        {
+            ["Operation"] = operation, ["Record"] = record,
+            ["ResourcePath"] = "mods/new.jar",
+            ["StagedPath"] = operation == "Undo" ? Path.GetRelativePath(_root, staged) : "",
+            ["PreviousRecordFile"] = Path.GetFileName(unrelatedRecordPath),
+            ["UndoRecordFile"] = Path.GetFileName(unrelatedRecordPath)
+        });
+        if (operation == "Undo")
+        {
+            File.Move(updated, staged);
+            File.Move(Path.Combine(_root, "recycle/mods/old.jar"), old);
+        }
+        Assert.Throws<IOException>(() => _bin.RecoverPendingOperations());
+        Assert.AreEqual(unrelatedRecord, File.ReadAllText(unrelatedRecordPath));
+        Assert.IsTrue(_bin.CanUndo(unrelatedUpdated));
+        Assert.IsTrue(File.Exists(journal));
+        if (operation == "Undo") Assert.AreEqual("new", File.ReadAllText(staged));
+    }
 }
