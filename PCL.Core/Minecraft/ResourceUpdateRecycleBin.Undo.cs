@@ -23,6 +23,7 @@ public sealed partial class ResourceUpdateRecycleBin
     {
         lock (_SyncRoot)
         {
+            RecoverPendingOperations();
             if (!_TryReadRecord(updatedPath, out var record, out var originalPath, out var backupPath, out var recordPath))
                 throw new IOException("没有找到该资源对应的旧版，或当前资源或其备份已被修改。");
             updatedPath = _GetResourcePath(updatedPath);
@@ -36,6 +37,12 @@ public sealed partial class ResourceUpdateRecycleBin
                 record.OriginalHash = _HashFile(backupPath);
             else if (!_Matches(backupPath, record.OriginalHash))
                 throw new IOException("资源旧版备份已被修改，无法撤回。");
+            var transactionPath = _WriteTransaction(new PendingOperation
+            {
+                Operation = "Undo", Record = record, ResourcePath = Path.GetRelativePath(_GameDirectory, updatedPath),
+                StagedPath = Path.GetRelativePath(_GameDirectory, stagedPath),
+                UndoRecordFile = Path.GetFileName(recordPath)
+            });
             var staged = false;
             var restored = false;
             try
@@ -52,6 +59,7 @@ public sealed partial class ResourceUpdateRecycleBin
                 {
                     if (restored) _Move(originalPath, backupPath);
                     if (staged) _Move(stagedPath, updatedPath);
+                    _Delete(transactionPath);
                 }
                 catch (Exception restoreError)
                 {
@@ -60,6 +68,7 @@ public sealed partial class ResourceUpdateRecycleBin
                 throw;
             }
             _Delete(recordPath);
+            _Delete(transactionPath);
         }
     }
 

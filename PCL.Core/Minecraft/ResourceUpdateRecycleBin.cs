@@ -39,6 +39,7 @@ public sealed partial class ResourceUpdateRecycleBin
     {
         lock (_SyncRoot)
         {
+            RecoverPendingOperations();
             originalPath = _GetResourcePath(originalPath);
             updatedPath = _GetResourcePath(updatedPath);
             downloadedPath = _GetUnlinkedPath(downloadedPath);
@@ -72,6 +73,7 @@ public sealed partial class ResourceUpdateRecycleBin
             };
             Directory.CreateDirectory(Path.GetDirectoryName(recordPath)!);
             var stagedPath = Path.Combine(Path.GetDirectoryName(updatedPath)!, ".pcl-update-" + Guid.NewGuid().ToString("N") + ".tmp");
+            var transactionPath = "";
             var backedUp = false;
             var installed = false;
             try
@@ -84,6 +86,11 @@ public sealed partial class ResourceUpdateRecycleBin
                     staged.Flush(true);
                 }
                 record.UpdatedHash = _HashFile(stagedPath);
+                transactionPath = _WriteTransaction(new PendingOperation
+                {
+                    Operation = "Replace", Record = record, StagedPath = Path.GetRelativePath(_GameDirectory, stagedPath),
+                    PreviousRecordFile = Path.GetFileName(previousRecordPath)
+                });
                 _Move(originalPath, backupPath);
                 backedUp = true;
                 _Move(stagedPath, updatedPath);
@@ -97,6 +104,7 @@ public sealed partial class ResourceUpdateRecycleBin
                     if (installed) _Move(updatedPath, stagedPath);
                     if (backedUp) _Move(backupPath, originalPath);
                     _Delete(stagedPath);
+                    if (transactionPath.Length > 0) _Delete(transactionPath);
                 }
                 catch (Exception restoreError)
                 {
@@ -108,6 +116,7 @@ public sealed partial class ResourceUpdateRecycleBin
             // 连续更新只允许撤回最后一次，撤回后按钮应消失。
             if (!string.IsNullOrEmpty(previousRecordPath) && !_SamePath(previousRecordPath, recordPath))
                 _Delete(previousRecordPath);
+            _Delete(transactionPath);
             // 安装已提交，缓存清理失败不能再将成功的更新报告为失败。
             try { _Delete(downloadedPath); }
             catch (IOException) { }
