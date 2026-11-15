@@ -173,6 +173,171 @@ public class ResourceUpdateRecycleBinTest
         Assert.IsTrue(_bin.CanUndo(updated));
     }
 
+    [TestMethod]
+    public void MissingBackupOrModifiedResourceHidesUndo()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        File.WriteAllText(updated, "manually replaced");
+        Assert.IsFalse(_bin.CanUndo(updated));
+        Assert.ThrowsExactly<IOException>(() => _bin.Undo(updated));
+        File.WriteAllText(updated, "new");
+        Assert.IsTrue(_bin.CanUndo(updated));
+        File.Delete(Path.Combine(_root, "recycle/mods/old.jar"));
+        Assert.IsFalse(_bin.CanUndo(updated));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ModifiedBackupHidesUndoAndPreservesInstalledResource(bool sameName)
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = sameName ? old : Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        Assert.IsTrue(_bin.CanUndo(updated));
+        var backup = Path.Combine(_root, "recycle/mods/old.jar");
+        var recordPath = Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single();
+        var record = File.ReadAllText(recordPath);
+
+        // 模拟显示撤回按钮后备份损坏，执行时必须重新校验。
+        File.WriteAllText(backup, "corrupt backup");
+        var reopened = new ResourceUpdateRecycleBin(_root);
+        Assert.IsFalse(reopened.CanUndo(updated));
+        Assert.ThrowsExactly<IOException>(() => reopened.Undo(updated));
+        Assert.AreEqual("new", File.ReadAllText(updated));
+        Assert.AreEqual("corrupt backup", File.ReadAllText(backup));
+        Assert.AreEqual(record, File.ReadAllText(recordPath));
+        Assert.AreEqual(0, Directory.GetFiles(_root, ".pcl-undo-*", SearchOption.AllDirectories).Length);
+        Assert.AreEqual(0, Directory.GetFiles(Path.Combine(_root, "recycle/.transactions"), "*.json").Length);
+        if (!sameName) Assert.IsFalse(File.Exists(old));
+
+        File.WriteAllText(backup, "old");
+        Assert.IsTrue(reopened.CanUndo(updated));
+        reopened.Undo(updated);
+        Assert.AreEqual("old", File.ReadAllText(old));
+    }
+
+    [TestMethod]
+    [DataRow("missing")]
+    [DataRow("empty")]
+    [DataRow("null")]
+    public void LegacyRecordWithoutOriginalHashCanStillUndo(string hashState)
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var recordPath = Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single();
+        var record = JsonNode.Parse(File.ReadAllText(recordPath))!.AsObject();
+        if (hashState == "missing") record.Remove("OriginalHash");
+        else record["OriginalHash"] = hashState == "null" ? null : "";
+        File.WriteAllText(recordPath, record.ToJsonString());
+
+        var reopened = new ResourceUpdateRecycleBin(_root);
+        Assert.IsTrue(reopened.CanUndo(updated));
+        reopened.Undo(updated);
+        Assert.AreEqual("old", File.ReadAllText(old));
+        Assert.IsFalse(File.Exists(updated));
+        Assert.IsFalse(File.Exists(recordPath));
+    }
+
+    [TestMethod]
+    [DataRow("invalid")]
+    [DataRow("0000000000000000000000000000000000000000000000000000000000000000")]
+    public void InvalidOriginalHashIsNotTreatedAsLegacyRecord(string hash)
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var recordPath = Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single();
+        var record = JsonNode.Parse(File.ReadAllText(recordPath))!;
+        record["OriginalHash"] = hash;
+        File.WriteAllText(recordPath, record.ToJsonString());
+
+        Assert.IsFalse(_bin.CanUndo(updated));
+        Assert.ThrowsExactly<IOException>(() => _bin.Undo(updated));
+        Assert.AreEqual("new", File.ReadAllText(updated));
+        Assert.AreEqual("old", File.ReadAllText(Path.Combine(_root, "recycle/mods/old.jar")));
+        Assert.AreEqual(hash, JsonNode.Parse(File.ReadAllText(recordPath))!["OriginalHash"]!.GetValue<string>());
+    }
+
+    [TestMethod]
+    public void UnsafeRecordCannotRestoreOutsideGameDirectory()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var recordPath = Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single();
+        var record = JsonNode.Parse(File.ReadAllText(recordPath))!;
+        record["OriginalPath"] = "../outside.jar";
+        File.WriteAllText(recordPath, record.ToJsonString());
+        Assert.IsFalse(_bin.CanUndo(updated));
+        Assert.ThrowsExactly<IOException>(() => _bin.Undo(updated));
+        Assert.AreEqual("new", File.ReadAllText(updated));
+    }
+
+    [TestMethod]
+    public void MissingDownloadDoesNotRemoveOldFile()
+    {
+        var old = _Write("mods/old.jar", "old");
+        Assert.ThrowsExactly<FileNotFoundException>(() => _bin.Replace(old,
+            Path.Combine(_root, "mods/new.jar"), Path.Combine(_root, "download/missing.jar")));
+        Assert.AreEqual("old", File.ReadAllText(old));
+    }
+
+    [TestMethod]
+    public void BulkUndoRestoresOnlyEligibleResourcesAndDeduplicatesSelection()
+    {
+        var oldMod = _Write("mods/mod-1.jar", "old mod");
+        var newMod = Path.Combine(_root, "mods/mod-2.jar");
+        _bin.Replace(oldMod, newMod, _Write("download/mod.jar", "new mod"));
+        var oldPack = _Write("resourcepacks/pack-1.zip", "old pack");
+        var newPack = Path.Combine(_root, "resourcepacks/pack-2.zip");
+        _bin.Replace(oldPack, newPack, _Write("download/pack.zip", "new pack"));
+        var untouched = _Write("mods/untouched.jar", "unchanged");
+
+        var result = _bin.UndoMany(new[] { newMod, untouched, newPack, newMod });
+        Assert.AreEqual(2, result.RestoredPaths.Count);
+        Assert.AreEqual(1, result.SkippedPaths.Count);
+        Assert.AreEqual(0, result.Failures.Count);
+        Assert.AreEqual("old mod", File.ReadAllText(oldMod));
+        Assert.AreEqual("old pack", File.ReadAllText(oldPack));
+        Assert.AreEqual("unchanged", File.ReadAllText(untouched));
+        Assert.IsFalse(File.Exists(newMod));
+        Assert.IsFalse(File.Exists(newPack));
+        Assert.IsFalse(_bin.CanUndo(oldMod));
+        Assert.IsFalse(_bin.CanUndo(oldPack));
+    }
+
+    [TestMethod]
+    public void BulkUndoContinuesAfterFailureAndPreservesFailedResource()
+    {
+        var blockedOld = _Write("shaderpacks/blocked-1.zip", "old shader");
+        var blockedNew = Path.Combine(_root, "shaderpacks/blocked-2.zip");
+        _bin.Replace(blockedOld, blockedNew, _Write("download/shader.zip", "new shader"));
+        File.WriteAllText(blockedOld, "another resource");
+        var old = _Write("mods/old.jar.disabled", "old mod");
+        var updated = Path.Combine(_root, "mods/new.jar.disabled");
+        _bin.Replace(old, updated, _Write("download/mod.jar", "new mod"));
+        var missingOld = _Write("mods/missing-1.jar", "old missing");
+        var missingNew = Path.Combine(_root, "mods/missing-2.jar");
+        _bin.Replace(missingOld, missingNew, _Write("download/missing.jar", "new missing"));
+        File.Delete(Path.Combine(_root, "recycle/mods/missing-1.jar"));
+
+        var result = _bin.UndoMany(new[] { blockedNew, missingNew, updated });
+        Assert.AreEqual(1, result.RestoredPaths.Count);
+        Assert.AreEqual(1, result.SkippedPaths.Count);
+        Assert.AreEqual(1, result.Failures.Count);
+        Assert.IsTrue(result.Failures.ContainsKey(blockedNew));
+        Assert.AreEqual("new shader", File.ReadAllText(blockedNew));
+        Assert.AreEqual("another resource", File.ReadAllText(blockedOld));
+        Assert.AreEqual("old shader", File.ReadAllText(Path.Combine(_root, "recycle/shaderpacks/blocked-1.zip")));
+        Assert.AreEqual("new missing", File.ReadAllText(missingNew));
+        Assert.AreEqual("old mod", File.ReadAllText(old));
+        Assert.IsTrue(_bin.CanUndo(blockedNew));
+    }
+
     private string _Write(string relativePath, string content)
     {
         var path = Path.Combine(_root, relativePath);
