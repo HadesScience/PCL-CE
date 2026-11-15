@@ -533,4 +533,145 @@ public class ResourceUpdateRecycleBinTest
         Assert.IsTrue(_bin.CanUndo(updated));
     }
 
+    [TestMethod]
+    public void LegacyDisabledRecordCanBeReadAfterToggle()
+    {
+        var old = _Write("mods/old.jar.disabled", "old");
+        var updated = Path.Combine(_root, "mods/new.jar.disabled");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var record = Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single();
+        var enabled = updated[..^".disabled".Length];
+        var legacyPath = _GetRecordPath(enabled);
+        File.Move(record, legacyPath);
+        File.Move(updated, enabled);
+        Assert.IsTrue(_bin.CanUndo(enabled));
+        _bin.Undo(enabled);
+        Assert.AreEqual("old", File.ReadAllText(old));
+        Assert.AreEqual(0, Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Length);
+    }
+
+    [TestMethod]
+    public void AmbiguousToggleDoesNotRestoreSibling()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        File.Move(updated, updated + ".disabled");
+        File.WriteAllText(updated + ".old", "new");
+        Assert.IsFalse(_bin.CanUndo(updated + ".disabled"));
+        Assert.IsFalse(_bin.CanUndo(updated + ".old"));
+    }
+
+    [TestMethod]
+    public void UndoRechecksAmbiguousRecordsAfterAvailabilityIndexWasBuilt()
+    {
+        var original = _Write("mods/original.jar", "old");
+        var updated = Path.Combine(_root, "mods/current.jar");
+        _bin.Replace(original, updated, _Write("download/new.jar", "new"));
+        var unrelated = _Write("mods/unrelated.jar", "unrelated old");
+        _bin.Replace(unrelated, unrelated, _Write("download/unrelated.jar", "new"));
+
+        var disabled = updated + ".disabled";
+        File.Move(updated, disabled);
+        Assert.IsTrue(_bin.CanUndo(disabled));
+
+        var recordPath = _GetRecordPath(unrelated);
+        var record = JsonNode.Parse(File.ReadAllText(recordPath))!;
+        record["UpdatedPath"] = Path.GetRelativePath(_root, updated + ".old");
+        File.WriteAllText(recordPath, record.ToJsonString());
+
+        Assert.ThrowsExactly<IOException>(() => _bin.Undo(disabled));
+        Assert.AreEqual("new", File.ReadAllText(disabled));
+        _bin.RecoverPendingOperations();
+        Assert.IsFalse(_bin.CanUndo(disabled));
+    }
+
+    [TestMethod]
+    public void RecoveryPreservesConflictingFileAndJournal()
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var record = JsonNode.Parse(File.ReadAllText(Directory.GetFiles(Path.Combine(_root, "recycle/.records"), "*.json").Single()))!;
+        var staged = Path.Combine(_root, "mods/.pcl-undo-" + Guid.NewGuid().ToString("N") + ".tmp");
+        var journal = _WriteJournal(new JsonObject
+        {
+            ["Operation"] = "Undo", ["Record"] = record.DeepClone(), ["ResourcePath"] = "mods/new.jar",
+            ["StagedPath"] = Path.GetRelativePath(_root, staged),
+            ["UndoRecordFile"] = Path.GetFileName(_GetRecordPath(updated))
+        });
+        File.Move(updated, staged);
+        File.WriteAllText(old, "unrelated");
+        Assert.Throws<IOException>(() => new ResourceUpdateRecycleBin(_root).RecoverPendingOperations());
+        Assert.AreEqual("unrelated", File.ReadAllText(old));
+        Assert.AreEqual("new", File.ReadAllText(staged));
+        Assert.AreEqual("old", File.ReadAllText(Path.Combine(_root, "recycle/mods/old.jar")));
+        Assert.IsTrue(File.Exists(journal));
+    }
+
+    private string _WriteJournal(JsonObject journal) =>
+        _Write("recycle/.transactions/" + Guid.NewGuid().ToString("N") + ".json", journal.ToJsonString());
+
+    private string _GetRecordPath(string updated) => (string)typeof(ResourceUpdateRecycleBin)
+        .GetMethod("_GetRecordPath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+        .Invoke(_bin, new object[] { updated })!;
+
+    private void _WriteRecord(string updated, JsonObject record)
+    {
+        var path = _GetRecordPath(updated);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, record.ToJsonString());
+    }
+
+    private static string _Hash(string path) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
+
+    [TestMethod]
+    [DataRow("mods")]
+    [DataRow("recycle/mods")]
+    [DataRow("recycle/.records")]
+    public void UndoRejectsDirectoriesLinkedAfterUpdate(string relativeDirectory)
+    {
+        var old = _Write("mods/old.jar", "old");
+        var updated = Path.Combine(_root, "mods/new.jar");
+        _bin.Replace(old, updated, _Write("download/new.jar", "new"));
+        var linked = Path.GetFullPath(Path.Combine(_root, relativeDirectory));
+        var moved = Path.Combine(_root, "redirected");
+        Directory.Move(linked, moved);
+        _CreateJunction(linked, moved);
+        try
+        {
+            Assert.IsFalse(_bin.CanUndo(updated));
+            Assert.Throws<IOException>(() => _bin.Undo(updated));
+            Assert.AreEqual("new", File.ReadAllText(updated));
+            Assert.AreEqual("old", File.ReadAllText(Path.Combine(_root, "recycle/mods/old.jar")));
+        }
+        finally { Directory.Delete(linked); }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void RejectsLinkedGameRootAndAncestor(bool ancestor)
+    {
+        var storage = Path.Combine(_root, "storage");
+        var linked = Path.Combine(_root, "linked");
+        var suffix = ancestor ? "game" : "";
+        var old = _Write("storage/" + suffix + "/mods/old.jar", "old");
+        var downloaded = _Write("download/new.jar", "new");
+        Directory.CreateDirectory(storage);
+        _CreateJunction(linked, storage);
+        try
+        {
+            var game = Path.Combine(linked, suffix);
+            var bin = new ResourceUpdateRecycleBin(game);
+            Assert.Throws<IOException>(() => bin.InitializeFolders());
+            Assert.Throws<IOException>(() => bin.Replace(Path.Combine(game, "mods/old.jar"),
+                Path.Combine(game, "mods/new.jar"), downloaded));
+            Assert.AreEqual("old", File.ReadAllText(old));
+            Assert.IsFalse(Directory.Exists(Path.Combine(storage, suffix, "recycle")));
+        }
+        finally { Directory.Delete(linked); }
+    }
+
 }
